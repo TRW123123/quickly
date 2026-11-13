@@ -1,0 +1,189 @@
+@font-face {
+  font-family: 'Figtree';
+  font-weight: 100 900;
+  font-style: normal;
+  src: url('./assets/fonts/Figtree-VariableFont_wght.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Figtree';
+  font-weight: 100 900;
+  font-style: italic;
+  src: url('./assets/fonts/Figtree-Italic-VariableFont_wght.woff2') format('woff2');
+}
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* apply as default */
+body {
+  font-family: 'Figtree', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+}
+
+/* base form/button/link/table styles to harmonize the UI */
+button {
+  @apply inline-flex items-center justify-center font-medium rounded-md;
+}
+
+/* Chart reveal-from-bottom animation */
+@keyframes chart-reveal-up {
+  from { clip-path: inset(100% 0 0 0); }
+  to   { clip-path: inset(0% 0 0 0); }
+}
+.chart-reveal-up {
+  animation: chart-reveal-up 0.6s ease-out forwards;
+}
+
+/* Remove focus outlines on mouse click globally; keep them for keyboard nav */
+*:focus {
+  outline: none !important;
+  box-shadow: none !important;
+}
+*:focus-visible {
+  outline: 2px solid theme('colors.teal.500') !important;
+  outline-offset: 2px;
+}
+
+
+a { @apply text-teal-500 hover:underline; }
+
+/* Onboarding modal entrance animation */
+@keyframes onboarding-in {
+  from { opacity: 0; transform: scale(0.95) translateY(10px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+.animate-in {
+  animation: onboarding-in 0.3s ease-out forwards;
+}
+
+input[type="text"], input[type="email"], input[type="number"], input[type="password"], select, textarea {
+  @apply block w-full rounded-md border-gray-300 shadow-sm;
+}
+input[type="text"]:focus-visible, input[type="email"]:focus-visible,
+input[type="number"]:focus-visible, input[type="password"]:focus-visible,
+select:focus-visible, textarea:focus-visible {
+  @apply ring-teal-500 border-teal-500;
+}
+
+/* make table cells easier to scan */
+table { @apply w-full border-collapse; }
+table th, table td { @apply px-2 py-1 border border-gray-200 text-left; }
+table tr:nth-child(even){ @apply bg-gray-50; }
+
+/* prevent page-level horizontal scroll; tables scroll inside their container */
+html, body { overflow-x: hidden; }
+.overflow-auto, .overflow-x-auto { -webkit-overflow-scrolling: touch; }
+
+/* page-level horizontal overflow is handled by html, body { overflow-x: hidden } above */
+
+/* custom utilities */
+/* .card utility removed in favor of Card component */
+
+/* drag-and-drop helpers for campaign priority ordering */
+tr.dragging { opacity: 0.35; }
+tr.drag-over td { border-top: 2px solid rgba(34, 211, 238, 0.8); }
+
+/* schedule styles copied from legacy CSS */
+.stats-row { @apply flex flex-wrap gap-6 mb-4; }
+.stat-card { @apply bg-white border border-gray-300 rounded p-3 min-w-[140px]; }
+.stat-card .num { @apply text-xl font-bold text-teal-400; }
+.stat-card .lbl { @apply text-xs text-gray-500; }
+.cal-toolbar { @apply flex flex-wrap items-center gap-3 mb-4; }
+.section-hdr { @apply cursor-pointer select-none text-gray-500 text-sm font-semibold flex items-center gap-1; }
+.section-hdr:hover { @apply text-gray-900; }
+.section-hdr .arrow { @apply transition-transform duration-150 inline-block; }
+.section-hdr .arrow.open { @apply rotate-90; }
+.date-hdr { @apply text-teal-400 font-semibold text-sm py-1 border-b border-gray-300 mt-3; }
+.email-row { @apply py-2 border-b border-gray-300 flex items-center gap-4 text-sm cursor-pointer transition-colors; }
+.email-row.header { @apply cursor-default font-semibold bg-gray-100; }
+.email-row.header:hover { @apply bg-gray-100; }
+.email-row:hover { @apply bg-teal-50; }
+.email-row.expanded { @apply bg-teal-100; }
+.email-row .time-col { @apply w-14 text-gray-500 font-mono; }
+.email-row .status-col { @apply w-20; }
+.email-row .lead-col { @apply w-44 overflow-hidden truncate font-mono text-xs; }
+.email-row .subj-col { @apply flex-1 overflow-hidden truncate; }
+.email-row .camp-col { @apply w-36 text-gray-500 overflow-hidden truncate; }
+.email-row .inbox-col { @apply w-40 text-gray-500 overflow-hidden truncate font-mono text-xs; }
+.badge-status { @apply inline-block px-2 py-0.5 rounded text-xs font-semibold uppercase tracking-wide; }
+.badge-status.sent { @apply bg-green-100 text-green-600; }
+
+/* lead status badges in schedule rows */
+.badge.active { @apply bg-green-100 text-green-600; }
+.badge.unsubscribed { @apply bg-gray-200 text-gray-500; }
+.badge.bounced { @apply bg-red-100 text-red-600; }
+.badge.replied { @apply bg-teal-100 text-teal-600; }
+.badge-status.scheduled { @apply bg-teal-100 text-teal-600; }
+.badge-status.failed { @apply bg-red-100 text-red-600; }
+.detail-panel { @apply hidden bg-gray-900 border border-gray-300 rounded mt-1 p-4 text-xs leading-relaxed; }
+.detail-panel.open { @apply block; }
+.detail-panel .dp-grid { @apply grid grid-cols-2 gap-x-8 gap-y-1; }
+.detail-panel .dp-label { @apply text-gray-500 font-medium; }
+.detail-panel .dp-val { @apply text-gray-900 break-words; }
+.detail-panel .dp-full { @apply col-span-2; }
+.detail-panel .body-preview { @apply bg-white p-3 rounded mt-1 max-h-48 overflow-auto font-mono text-xs; }
+
+html, body, #root {
+  height: 100%;
+}
+
+/* ── Custom slim scrollbars ─────────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-button {
+  display: none;
+  height: 0;
+  width: 0;
+}
+/* Light mode: soft, low-contrast thumb */
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.12);
+  border-radius: 99px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.26);
+}
+/* Dark mode: slightly lighter than the background */
+.dark ::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.30);
+}
+/* Firefox */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0, 0, 0, 0.12) transparent;
+}
+.dark * {
+  scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
+}
+
+/* Remove focus outlines inside recharts SVG */
+.recharts-wrapper *:focus,
+.recharts-wrapper *:focus-visible,
+.recharts-surface:focus,
+.recharts-surface:focus-visible {
+  outline: none !important;
+  box-shadow: none !important;
+}
+
+/* simple spinner */
+.loader {
+  border: 4px solid rgba(255,255,255,0.3);
+  border-top: 4px solid white;
+  border-radius: 50%;
+  width: 40px;
+  height: 40px;
+  animation: spin 1s linear infinite;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}

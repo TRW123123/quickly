@@ -1,0 +1,255 @@
+name: Release
+
+permissions:
+  contents: write
+
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to simulate (e.g. v1.0.0-test)'
+        required: true
+        default: 'v0.0.0-test'
+      push_image:
+        description: 'Push Docker image to Docker Hub'
+        type: boolean
+        required: false
+        default: false
+      create_release:
+        description: 'Create a GitHub Release (draft)'
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Determine tag
+        id: tagger
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "TAG=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "TAG=${GITHUB_REF##*/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            QUICKLY_VERSION=${{ steps.tagger.outputs.TAG }}
+            QUICKLY_TELEMETRY_KEY=${{ secrets.QUICKLY_TELEMETRY_KEY }}
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+          outputs: type=image,name=azowail/quickly,push-by-digest=true,name-canonical=true
+          cache-from: type=registry,ref=azowail/quickly:cache-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          cache-to: type=registry,ref=azowail/quickly:cache-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }},mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  merge:
+    runs-on: ubuntu-24.04
+    needs: build
+    if: github.event_name != 'workflow_dispatch' || inputs.push_image
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Determine tag
+        id: tagger
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "TAG=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "TAG=${GITHUB_REF##*/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create and push manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t azowail/quickly:${{ steps.tagger.outputs.TAG }} \
+            -t azowail/quickly:latest \
+            $(printf 'azowail/quickly@sha256:%s ' *)
+
+  # Release gate: boot the freshly pushed image against a real PostgreSQL and
+  # assert it serves and actually attaches the persistent scheduler job store.
+  # This is what would have caught #11 (greenlet crash-loop) and #14 (silent
+  # MemoryJobStore fallback) before they shipped. Skipped for no-push test
+  # dispatches (nothing is published to pull).
+  smoke:
+    runs-on: ubuntu-24.04
+    needs: merge
+    if: github.event_name != 'workflow_dispatch' || inputs.push_image
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine tag
+        id: tagger
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "TAG=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "TAG=${GITHUB_REF##*/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Pull the freshly pushed image
+        run: docker pull "azowail/quickly:${{ steps.tagger.outputs.TAG }}"
+
+      - name: Boot smoke
+        run: bash scripts/e2e_boot_smoke.sh "azowail/quickly:${{ steps.tagger.outputs.TAG }}"
+
+  release:
+    runs-on: ubuntu-24.04
+    needs: [merge, smoke]
+    if: github.event_name != 'workflow_dispatch' || inputs.create_release
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine tag
+        id: tagger
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "TAG=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "TAG=${GITHUB_REF##*/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Release with assets
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.tagger.outputs.TAG }}
+          name: ${{ steps.tagger.outputs.TAG }}
+          artifacts: "docker-compose.yml,docker-compose-not-host.yml,docker-compose.no-caddy.yml,.env.example,Caddyfile"
+          artifactErrorsFailBuild: true
+          draft: ${{ github.event_name == 'workflow_dispatch' }}
+          prerelease: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ## What's in this release
+
+            Docker image: `azowail/quickly:${{ steps.tagger.outputs.TAG }}`
+            Also tagged as: `azowail/quickly:latest`
+
+            ---
+
+            ## Setup Options
+
+            ### 🖥️ Option 1 — Self-hosted VPS (recommended)
+
+            Requires Docker and a domain pointed at your server.
+
+            **Self-hosted VPS** (Docker Compose: Postgres + Quickly + Caddy in Docker):
+
+            ```bash
+            mkdir quickly && cd quickly
+            docker volume create quickly_pgdata
+            curl -LO https://github.com/AbdelftahZowail/Quickly/releases/latest/download/docker-compose.yml
+            curl -LO https://github.com/AbdelftahZowail/Quickly/releases/latest/download/Caddyfile
+            curl -LO https://github.com/AbdelftahZowail/Quickly/releases/latest/download/.env.example
+            mv .env.example .env
+            # Edit .env — set CADDY_HOST, BASE_URL, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
+            docker compose up -d
+            ```
+
+            **Already using Caddy on the server?** Download `docker-compose-not-host.yml` instead of `docker-compose.yml` (no Caddyfile in Docker). Point your host Caddy at `127.0.0.1:5050`. See [INSTALL.md](https://github.com/AbdelftahZowail/Quickly/blob/main/docs/INSTALL.md).
+
+            **No reverse proxy in Docker (any TLS/proxy on the host):** Use `docker-compose.no-caddy.yml` — Postgres + app on port 8000, managed data volume (no `docker volume create`). Set `BASE_URL` in `.env` to match how users reach the app.
+
+            Caddy handles HTTPS automatically with Let's Encrypt. Open `https://yourdomain.com`.
+
+            **Required env vars:**
+            | Variable | Description |
+            |---|---|
+            | `CADDY_HOST` | Your domain (e.g. `yourdomain.com`) |
+            | `BASE_URL` | Full URL with protocol (e.g. `https://yourdomain.com`) |
+            | `GOOGLE_CLIENT_ID` | Google OAuth 2.0 client ID |
+            | `GOOGLE_CLIENT_SECRET` | Google OAuth 2.0 client secret |
+
+            ---
+
+            ### ☁️ Option 2 — PaaS (Railway, Render, Fly.io, etc.)
+
+            1. Create a new service using Docker image `azowail/quickly:${{ steps.tagger.outputs.TAG }}`
+            2. Add a managed PostgreSQL database; set its connection string as `DATABASE_URL`
+            3. Set `BASE_URL` to your platform's assigned URL
+            4. Set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`
+            5. Deploy — no Caddyfile needed (the platform handles HTTPS)
+
+            ---
+
+            ### 🛠️ Option 3 — Local / developer setup
+
+            ```bash
+            git clone https://github.com/AbdelftahZowail/Quickly.git
+            cd quickly
+            cp .env.example .env   # fill in GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, BASE_URL
+            docker compose -f docker-compose.dev.yml up
+            ```
+
+            Or run manually:
+            ```bash
+            pip install -r requirements.txt
+            uvicorn app.main:app --reload   # backend on :8000
+            cd frontend && npm install && npm run dev   # frontend on :5173
+            ```
+
+            ---
+
+            ## After Launching
+
+            1. Open the app and go to **Inboxes** → add a Gmail account via OAuth
+            2. Create a campaign with sequences
+            3. Add leads — the queue engine handles scheduling automatically
+            4. Monitor sends in **Schedule** or via `GET /api/status`
+
+            > **Docs:** [INSTALL.md](https://github.com/AbdelftahZowail/Quickly/blob/main/docs/INSTALL.md) · [API.md](https://github.com/AbdelftahZowail/Quickly/blob/main/docs/API.md) · [WEBHOOKS.md](https://github.com/AbdelftahZowail/Quickly/blob/main/docs/WEBHOOKS.md)

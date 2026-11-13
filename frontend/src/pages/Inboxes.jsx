@@ -1,0 +1,2511 @@
+import { useState, useEffect, useRef, useMemo } from 'react';
+import { api, apiCache } from '../api';
+import { Button } from '../components/ui/Button';
+import { Card } from '../components/ui/Card';
+import { useAppMode } from '../context/AppModeContext';
+import { useConfirm } from '../context/ConfirmContext';
+import { useNotify } from '../context/NotificationContext';
+import { useSystemHealth } from '../context/SystemHealthContext';
+
+/** Backend stores jitter in seconds (cap 600). Forms show minutes and convert on change / save. */
+const JITTER_MAX_MINUTES = 10;
+
+/** Full Beacon setup guide in the Quickly repo (INSTALL.md). */
+const BEACON_SETUP_DOCS_URL =
+  'https://github.com/AbdelftahZowail/Quickly/blob/main/docs/INSTALL.md#quickly-beacon-recommended-custom-tracking-hostnames';
+
+function CollapsibleInfo({ children }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="mt-1">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="text-xs font-medium text-gray-600 hover:text-gray-900 flex items-center gap-1.5 text-left"
+        aria-expanded={open}
+      >
+        <svg
+          className={`w-3.5 h-3.5 shrink-0 text-gray-500 transition-transform ${open ? 'rotate-90' : ''}`}
+          fill="none"
+          stroke="currentColor"
+          viewBox="0 0 24 24"
+          aria-hidden
+        >
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+        </svg>
+        {open ? 'Hide info' : 'Show info'}
+      </button>
+      {open && (
+        <div className="mt-2 pl-1 space-y-2 text-xs text-gray-600 border-l-2 border-gray-200 ml-0.5 py-0.5">
+          {children}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Human label + colour for one diagnostic stage. */
+const STAGE_LABELS = {
+  dns: 'DNS',
+  tcp: 'TCP connect',
+  tls: 'TLS',
+  ehlo: 'EHLO',
+  auth: 'AUTH',
+  mail_from: 'MAIL FROM',
+  rcpt_to: 'RCPT TO',
+  data: 'DATA',
+  imap: 'IMAP',
+};
+
+function diagnosticReportToText(report) {
+  if (!report) return '';
+  const lines = [
+    'Quickly SMTP diagnostic report',
+    `Target: ${report.host}:${report.port}  mode=${report.mode}`,
+    `Result: ${report.ok ? 'PASS' : 'FAIL'}  (${report.duration_ms ?? 0} ms)`,
+    '',
+  ];
+  (report.stages || []).forEach((stage) => {
+    lines.push(`[${stage.ok ? 'PASS' : 'FAIL'}] ${STAGE_LABELS[stage.name] || stage.name}: ${stage.detail || ''}`);
+    (stage.raw || []).forEach((raw) => lines.push(`       ${raw}`));
+  });
+  lines.push('');
+  if (report.timeouts) {
+    lines.push(
+      `Timeouts: ${report.timeouts.stage_seconds}s per stage, ${report.timeouts.total_seconds}s overall`
+      + ` (elapsed ${report.timeouts.elapsed_seconds}s`
+      + `${report.timeouts.total_exhausted ? ', overall budget exhausted' : ''})`,
+    );
+  }
+  lines.push(`Verdict: ${report.verdict || ''}`);
+  if (report.suggested_mode) {
+    lines.push(`Suggested mode: ${report.suggested_mode === 'ssl' ? 'SSL' : 'STARTTLS'}`);
+  }
+  (report.hints || []).forEach((hint) => lines.push(`  - ${hint}`));
+  return lines.join('\n');
+}
+
+/** Staged diagnostic report: ✅/❌ per stage, verdict, fix hints, copy button. */
+function SmtpDiagnosticReport({ report, onTrySsl, onTryStarttls, busy }) {
+  const [expanded, setExpanded] = useState({});
+  const [copied, setCopied] = useState(false);
+  if (!report) return null;
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(diagnosticReportToText(report));
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* clipboard may be unavailable (http origin) — ignore */
+    }
+  };
+
+  return (
+    <div className="mt-1 border border-gray-200 rounded-md bg-white overflow-hidden">
+      <div className="flex items-center justify-between gap-2 px-3 py-2 bg-gray-50 border-b border-gray-200">
+        <span className={`text-xs font-semibold ${report.ok ? 'text-green-700' : 'text-red-600'}`}>
+          {report.ok ? 'Diagnosis passed' : 'Diagnosis found a problem'}
+        </span>
+        <div className="flex items-center gap-2">
+          <span
+            className="text-[10px] text-gray-400"
+            title={report.timeouts
+              ? `${report.timeouts.stage_seconds}s per stage · ${report.timeouts.total_seconds}s overall budget`
+              : undefined}
+          >
+            {report.duration_ms ?? 0} ms{report.timeouts ? ` · ${report.timeouts.stage_seconds}s/stage, ${report.timeouts.total_seconds}s max` : ''}
+          </span>
+          <button
+            type="button"
+            onClick={copy}
+            className="text-[11px] font-medium text-blue-600 hover:text-blue-800"
+          >
+            {copied ? 'Copied ✓' : 'Copy report'}
+          </button>
+        </div>
+      </div>
+      <div className="px-3 py-2 space-y-1">
+        {(report.stages || []).map((stage) => (
+          <div key={stage.name} className="text-xs">
+            <button
+              type="button"
+              onClick={() => setExpanded((e) => ({ ...e, [stage.name]: !e[stage.name] }))}
+              className="flex items-start gap-1.5 text-left w-full hover:bg-gray-50 rounded px-1 -mx-1 py-0.5"
+            >
+              <span className="shrink-0">{stage.ok ? '✅' : '❌'}</span>
+              <span className="font-medium text-gray-700 shrink-0">{STAGE_LABELS[stage.name] || stage.name}</span>
+              <span className="text-gray-500 truncate">{stage.detail}</span>
+              {stage.raw?.length > 0 && (
+                <span className="ml-auto text-gray-300 shrink-0">{expanded[stage.name] ? '▾' : '▸'}</span>
+              )}
+            </button>
+            {expanded[stage.name] && stage.raw?.length > 0 && (
+              <pre className="mt-1 mb-1 ml-5 px-1.5 py-1 bg-gray-50 rounded text-[10px] leading-snug text-gray-600 overflow-x-auto whitespace-pre-wrap break-all">
+                {stage.raw.join('\n')}
+              </pre>
+            )}
+          </div>
+        ))}
+      </div>
+      {report.verdict && (
+        <p className="px-3 pb-2 text-xs text-gray-700">
+          <span className="font-medium">Verdict: </span>{report.verdict}
+        </p>
+      )}
+      {report.hints?.length > 0 && (
+        <div className="px-3 pb-2 space-y-1">
+          {report.hints.map((hint, i) => (
+            <p key={i} className="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded px-2 py-1">
+              💡 {hint}
+            </p>
+          ))}
+        </div>
+      )}
+      {report.suggested_mode && (
+        <div className="px-3 pb-3">
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={busy}
+            onClick={report.suggested_mode === 'ssl' ? onTrySsl : onTryStarttls}
+          >
+            {report.suggested_mode === 'ssl' ? 'Try SSL instead (465)' : 'Try STARTTLS instead (587)'}
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RedirectUriBlock({ uri, size = 'xs' }) {
+  if (!uri) return null;
+  const textCls = size === 'sm' ? 'text-sm' : 'text-xs';
+  const codeCls = size === 'sm' ? 'text-xs' : 'text-[11px]';
+  return (
+    <div className={`text-gray-500 ${textCls} mt-1 min-w-0 w-full max-w-full`}>
+      <span className="block text-[10px] font-medium uppercase tracking-wide text-gray-400 mb-0.5">Redirect URI</span>
+      <code
+        className={`block font-mono ${codeCls} leading-snug break-all whitespace-pre-wrap bg-gray-50 rounded px-1.5 py-1 border border-gray-100 max-w-full`}
+        title={uri}
+      >
+        {uri}
+      </code>
+    </div>
+  );
+}
+
+function clampJitterSeconds(s) {
+  const n = Number(s);
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(600, Math.max(0, Math.round(n)));
+}
+
+function jitterInputMinutesFromSeconds(sec) {
+  return clampJitterSeconds(sec ?? 0) / 60;
+}
+
+function jitterSecondsFromInputMinutes(minVal) {
+  const v = parseFloat(minVal);
+  if (!Number.isFinite(v) || v < 0) return 0;
+  return clampJitterSeconds(Math.min(JITTER_MAX_MINUTES, v) * 60);
+}
+
+function formatJitterMinutesLabel(seconds) {
+  const s = clampJitterSeconds(seconds ?? 0);
+  if (s <= 0) return null;
+  const min = s / 60;
+  const t = Number.isInteger(min) ? String(min) : (Math.round(min * 10) / 10).toString();
+  return `up to ${t} min random`;
+}
+
+/**
+ * Tracking: three choices — app URL, Beacon (setup URL + Connect), or DNS setup (CNAME + Verify).
+ * Long-form help is behind “Show info” for each option.
+ */
+function InboxTrackingOptions({
+  variant,
+  wrapClassName = 'space-y-4',
+  radioName,
+  cnameUiEnabled,
+  cnameTarget,
+  uiMode,
+  onUiModeChange,
+  trackingDomain,
+  onTrackingDomainChange,
+  onDnsVerifyChange,
+  beaconConnected,
+  beaconBaseUrl,
+  beaconSetupUrl,
+  onBeaconSetupUrlChange,
+  onConnectBeacon,
+  onDisconnectBeacon,
+  beaconConnecting,
+  siblingInboxesForReuse = [],
+  currentInboxId = null,
+  onBeaconConnectFromSibling,
+  onReuseDnsDomain,
+  dnsAutoVerifyTrigger = 0,
+}) {
+  const hostHint = cnameTarget || (typeof window !== 'undefined' ? window.location.hostname : '');
+  const dnsActive = uiMode === 'dns';
+  const beaconActive = uiMode === 'beacon';
+  const [verifyState, setVerifyState] = useState(null);
+  const [verifyMsg, setVerifyMsg] = useState('');
+  const abortRef = useRef(false);
+  const [reuseOpen, setReuseOpen] = useState(false);
+  const [reuseSearch, setReuseSearch] = useState('');
+  const [reuseBusyKey, setReuseBusyKey] = useState(null);
+
+  const reuseRowsAll = useMemo(() => {
+    const list = Array.isArray(siblingInboxesForReuse) ? siblingInboxesForReuse : [];
+    return list
+      .filter((i) => i.id !== currentInboxId)
+      .flatMap((i) => {
+        const label = (i.display_name || '').trim() || i.email || `Inbox #${i.id}`;
+        const rows = [];
+        if (!beaconConnected && i.beacon_connected && (i.beacon_base_url || '').trim()) {
+          const primary = (i.beacon_base_url || '').trim();
+          const hay = `${primary} ${label} ${i.email || ''}`.toLowerCase();
+          rows.push({
+            key: `beacon-${i.id}`,
+            kind: 'beacon',
+            inboxId: i.id,
+            primary,
+            secondary: label,
+            hay,
+          });
+        }
+        if (
+          !beaconConnected
+          && cnameUiEnabled
+          && (i.tracking_domain || '').trim()
+          && !i.beacon_connected
+        ) {
+          const primary = (i.tracking_domain || '').trim();
+          const hay = `${primary} ${label} ${i.email || ''}`.toLowerCase();
+          rows.push({
+            key: `dns-${i.id}`,
+            kind: 'dns',
+            inboxId: i.id,
+            primary,
+            secondary: label,
+            hay,
+          });
+        }
+        return rows;
+      });
+  }, [siblingInboxesForReuse, currentInboxId, beaconConnected, cnameUiEnabled]);
+
+  const reuseRows = useMemo(() => {
+    const q = (reuseSearch || '').trim().toLowerCase();
+    return reuseRowsAll.filter((r) => !q || r.hay.includes(q));
+  }, [reuseRowsAll, reuseSearch]);
+
+  const hasReuseOptions = variant === 'edit' && currentInboxId != null && reuseRowsAll.length > 0;
+
+  const handleDnsValue = (v) => {
+    abortRef.current = true;
+    setVerifyState(null);
+    setVerifyMsg('');
+    onDnsVerifyChange?.(false);
+    onTrackingDomainChange(v);
+  };
+
+  const verifyDns = async () => {
+    const domain = (trackingDomain || '').trim();
+    if (!domain) return;
+    abortRef.current = false;
+    setVerifyState('checking');
+    setVerifyMsg('Registering domain…');
+    try {
+      await api.post('/settings/register-tracking-domain-pending', { domain });
+    } catch (_) { /* non-fatal */ }
+    if (abortRef.current) return;
+    const MAX_ATTEMPTS = 5;
+    const RETRY_DELAY_MS = 8000;
+    let lastError = 'Timed out waiting for SSL certificate to be provisioned';
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      if (abortRef.current) return;
+      setVerifyMsg(attempt === 0 ? 'Provisioning SSL certificate…' : `Waiting for SSL certificate… (attempt ${attempt + 1}/${MAX_ATTEMPTS})`);
+      try {
+        const data = await api.get(
+          `/settings/verify-tracking-domain?domain=${encodeURIComponent(domain)}`
+        );
+        if (abortRef.current) return;
+        if (data.ok) {
+          setVerifyState('ok');
+          setVerifyMsg('');
+          onDnsVerifyChange?.(true);
+          return;
+        }
+        lastError = data.error || 'Unknown error';
+      } catch (e) {
+        if (abortRef.current) return;
+        lastError = e.message;
+      }
+      if (attempt < MAX_ATTEMPTS - 1) {
+        await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+      }
+    }
+    if (!abortRef.current) {
+      setVerifyState({ error: lastError });
+      setVerifyMsg('');
+      onDnsVerifyChange?.(false);
+    }
+  };
+
+  useEffect(() => {
+    if (uiMode !== 'dns') {
+      abortRef.current = true;
+      setVerifyState(null);
+      setVerifyMsg('');
+    }
+  }, [uiMode]);
+
+  useEffect(() => {
+    if (variant !== 'edit' || !dnsAutoVerifyTrigger) return;
+    if (uiMode !== 'dns' || !(trackingDomain || '').trim()) return;
+    verifyDns();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: run once per trigger after DNS mode + domain applied
+  }, [dnsAutoVerifyTrigger]);
+
+  const dnsInputDisabled = !dnsActive;
+  const beaconInputDisabled = variant === 'add' || !beaconActive || beaconConnected;
+  const canVerifyDns = dnsActive && (trackingDomain || '').trim().length > 0;
+
+  return (
+    <div className={`${wrapClassName} min-w-0 max-w-full`}>
+      {variant === 'edit' && currentInboxId != null && (
+        <div className="rounded-md border border-gray-200 bg-white overflow-hidden min-w-0 max-w-full">
+          <button
+            type="button"
+            onClick={() => setReuseOpen((o) => !o)}
+            className="w-full flex items-center gap-2 text-left px-3 py-2 text-xs font-medium text-gray-800 hover:bg-gray-50"
+            aria-expanded={reuseOpen}
+          >
+            <svg
+              className={`w-3.5 h-3.5 shrink-0 text-gray-500 transition-transform ${reuseOpen ? 'rotate-90' : ''}`}
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+              aria-hidden
+            >
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+            </svg>
+            Use a tracker already linked to another inbox
+            {!reuseOpen && hasReuseOptions && (
+              <span className="ml-auto text-[10px] font-normal text-gray-500">{reuseRowsAll.length} available</span>
+            )}
+          </button>
+          {reuseOpen && (
+            <div className="px-3 pb-3 pt-0 border-t border-gray-100 space-y-2 min-w-0 max-w-full">
+              {!hasReuseOptions ? (
+                <p className="text-xs text-gray-500 pt-2">
+                  No other inboxes have Beacon or DNS tracking yet. Connect one inbox first, or paste a setup URL below.
+                </p>
+              ) : (
+                <>
+                  <input
+                    type="search"
+                    value={reuseSearch}
+                    onChange={(e) => setReuseSearch(e.target.value)}
+                    placeholder="Search by URL, domain, or inbox…"
+                    className="w-full min-w-0 max-w-full box-border border rounded px-2 py-1.5 text-xs bg-white"
+                  />
+                  {reuseSearch.trim() && reuseRows.length === 0 && reuseRowsAll.length > 0 ? (
+                    <p className="text-xs text-gray-500">No matches — clear search to see all {reuseRowsAll.length} tracker(s).</p>
+                  ) : null}
+                  <ul className="max-h-40 overflow-y-auto space-y-1.5 min-w-0">
+                    {reuseRows.map((r) => (
+                      <li
+                        key={r.key}
+                        className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between rounded border border-gray-100 bg-gray-50/80 px-2 py-1.5 min-w-0"
+                      >
+                        <div className="min-w-0 text-xs">
+                          <span className="font-medium text-gray-700">
+                            {r.kind === 'beacon' ? 'Beacon' : 'DNS'}
+                          </span>
+                          <code className="block mt-0.5 font-mono text-[11px] text-teal-900 break-all [overflow-wrap:anywhere]">
+                            {r.primary}
+                          </code>
+                          <span className="text-gray-500 text-[11px]">{r.secondary}</span>
+                        </div>
+                        <button
+                          type="button"
+                          disabled={
+                            beaconConnecting
+                            || reuseBusyKey === r.key
+                            || (r.kind === 'beacon' && !onBeaconConnectFromSibling)
+                            || (r.kind === 'dns' && !onReuseDnsDomain)
+                          }
+                          onClick={async () => {
+                            if (r.kind === 'beacon' && onBeaconConnectFromSibling) {
+                              setReuseBusyKey(r.key);
+                              try {
+                                await onBeaconConnectFromSibling(r.inboxId);
+                              } finally {
+                                setReuseBusyKey(null);
+                              }
+                            } else if (r.kind === 'dns' && onReuseDnsDomain) {
+                              onReuseDnsDomain(r.primary);
+                            }
+                          }}
+                          className="shrink-0 self-start sm:self-center px-2 py-1 text-[11px] rounded border border-teal-600 bg-teal-600 text-white hover:bg-teal-700 disabled:opacity-50 disabled:hover:bg-teal-600"
+                        >
+                          {r.kind === 'beacon'
+                            ? beaconConnecting && reuseBusyKey === r.key
+                              ? 'Connecting…'
+                              : 'Connect'
+                            : 'Use & verify'}
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Use app domain */}
+      <div className="space-y-2 min-w-0 max-w-full">
+        <label className="flex items-start gap-2 cursor-pointer text-sm">
+          <input
+            type="radio"
+            name={radioName}
+            className="mt-0.5 shrink-0"
+            checked={uiMode === 'app'}
+            onChange={() => onUiModeChange('app')}
+          />
+          <span className="font-medium text-gray-800">Use app domain</span>
+        </label>
+        <div className="ml-6 min-w-0 max-w-full border-l-2 border-gray-200 pl-3 py-0.5">
+          <CollapsibleInfo>
+            <p>
+              Open, click, and unsubscribe links use your Quickly app URL{' '}
+              <span className="text-gray-500 font-mono break-all">({hostHint})</span>. No Beacon service and no extra DNS records are required.
+            </p>
+          </CollapsibleInfo>
+        </div>
+      </div>
+
+      {/* Beacon */}
+      <div className="space-y-2 min-w-0 max-w-full">
+        <label className="flex items-start gap-2 cursor-pointer text-sm min-w-0">
+          <input
+            type="radio"
+            name={radioName}
+            className="mt-0.5 shrink-0"
+            checked={uiMode === 'beacon'}
+            onChange={() => onUiModeChange('beacon')}
+          />
+          <span className="font-medium text-gray-800">Beacon (Recommended)</span>
+        </label>
+        <div className="ml-6 min-w-0 max-w-full space-y-2 border-l-2 border-gray-200 pl-3 py-0.5 box-border">
+          <div className="w-full min-w-0 max-w-full space-y-2">
+            {beaconConnected ? (
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between w-full min-w-0">
+                <p className="text-xs text-gray-700 min-w-0 break-words [overflow-wrap:anywhere]">
+                  Connected: <code className="text-teal-800 break-all">{beaconBaseUrl || ''}</code>
+                </p>
+                <Button type="button" size="sm" variant="outline" className="shrink-0 self-start" onClick={onDisconnectBeacon}>
+                  Disconnect
+                </Button>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-2 w-full min-w-0 max-w-full">
+                <input
+                  type="url"
+                  disabled={beaconInputDisabled}
+                  className="w-full min-w-0 max-w-full box-border border rounded px-2 py-1.5 font-mono text-xs bg-white disabled:bg-gray-100 disabled:text-gray-500"
+                  placeholder="https://track.example.com/?token=…"
+                  value={beaconSetupUrl}
+                  onChange={e => onBeaconSetupUrlChange(e.target.value)}
+                />
+                <button
+                  type="button"
+                  disabled={beaconInputDisabled || !beaconSetupUrl.trim() || beaconConnecting}
+                  onClick={onConnectBeacon}
+                  className="self-start shrink-0 px-2 py-1 text-xs rounded border border-gray-300 bg-white hover:bg-gray-50 disabled:opacity-50"
+                >
+                  {beaconConnecting ? 'Connecting…' : 'Connect'}
+                </button>
+              </div>
+            )}
+          </div>
+          {variant === 'add' && (
+            <p className="text-xs text-amber-800 bg-amber-50 border border-amber-100 rounded px-2 py-1">
+              Connect is available after the inbox exists — finish adding the inbox, then open <strong>Edit</strong> and choose Beacon (Recommended) here.
+            </p>
+          )}
+          <CollapsibleInfo>
+            <p className="font-medium text-gray-700">How Beacon works</p>
+            <p>
+              Run the Beacon service on the HTTPS hostname you want for tracking links. While Quickly is not connected yet, open Beacon&apos;s root URL in a browser and copy the <strong>setup URL</strong> (it includes{' '}
+              <code className="bg-gray-100 px-0.5 rounded">?token=</code>
+              ). Paste it above and click Connect. On Beacon, set{' '}
+              <code className="bg-gray-100 px-0.5 rounded">BEACON_PUBLIC_BASE_URL</code>
+              {' '}if printed links should use a specific public origin.
+            </p>
+            <p>
+              <a
+                href={BEACON_SETUP_DOCS_URL}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-blue-700 hover:underline break-all"
+              >
+                Full setup guide (Quickly repo → INSTALL.md)
+              </a>
+            </p>
+          </CollapsibleInfo>
+        </div>
+      </div>
+
+      {/* DNS setup */}
+      {cnameUiEnabled && (
+        <div className="space-y-2 min-w-0 max-w-full">
+          <label className="flex items-start gap-2 cursor-pointer text-sm min-w-0">
+            <input
+              type="radio"
+              name={radioName}
+              className="mt-0.5 shrink-0"
+              checked={dnsActive}
+              onChange={() => onUiModeChange('dns')}
+            />
+            <span className="font-medium text-gray-800">DNS setup</span>
+          </label>
+          <div className="ml-6 min-w-0 max-w-full space-y-2 border-l-2 border-gray-200 pl-3 py-0.5 box-border">
+            <div className="flex flex-col gap-2 w-full min-w-0 max-w-full">
+              <input
+                type="text"
+                disabled={dnsInputDisabled}
+                className="w-full min-w-0 max-w-full box-border border rounded px-2 py-1.5 font-mono text-sm bg-white disabled:bg-gray-100 disabled:text-gray-500"
+                placeholder="mail.yourdomain.com"
+                value={trackingDomain || ''}
+                onChange={e => handleDnsValue(e.target.value)}
+                onFocus={() => {
+                  if (!dnsActive) onUiModeChange('dns');
+                }}
+              />
+              <button
+                type="button"
+                disabled={!canVerifyDns || verifyState === 'checking'}
+                onClick={verifyDns}
+                className="self-start shrink-0 px-2 py-1 text-xs rounded border border-gray-300 bg-white hover:bg-gray-50 disabled:opacity-50"
+              >
+                {verifyState === 'checking' ? 'Verifying…' : 'Verify'}
+              </button>
+            </div>
+            {verifyState === 'checking' && verifyMsg && (
+              <p className="text-xs text-blue-600 flex items-center gap-1">
+                <span className="inline-block w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
+                {verifyMsg}
+              </p>
+            )}
+            {verifyState === 'ok' && (
+              <p className="text-xs text-green-600 font-medium">✓ Domain is reachable and pointing to this server</p>
+            )}
+            {verifyState && verifyState !== 'checking' && verifyState !== 'ok' && (
+              <p className="text-xs text-red-600">✗ {verifyState.error}</p>
+            )}
+            <CollapsibleInfo>
+              <p className="font-medium text-gray-700">DNS setup (CNAME)</p>
+              <p>Add a <code>CNAME</code> at your DNS host pointing your tracking hostname at this Quickly server:</p>
+              <pre className="bg-white border rounded p-2 overflow-x-auto whitespace-pre-wrap break-all text-gray-700 text-[11px]">
+                {`${(trackingDomain || '').trim() || 'mail.yourdomain.com'}  CNAME  ${cnameTarget || 'your-app-host'}.`}
+              </pre>
+              <p>
+                Caddy requests a certificate on the first HTTPS hit. Select <strong>DNS setup</strong>, enter the hostname, run <strong>Verify</strong>, then save the inbox.
+              </p>
+            </CollapsibleInfo>
+          </div>
+        </div>
+      )}
+
+      {!cnameUiEnabled && (trackingDomain || '').trim() && !beaconConnected && (
+        <div className="text-xs text-amber-800 space-y-2 bg-amber-50 border border-amber-200 rounded p-2">
+          <p>
+            Legacy CNAME tracking domain saved:{' '}
+            <code className="font-mono">{(trackingDomain || '').trim()}</code>. Prefer Beacon for new setups.
+          </p>
+          <button
+            type="button"
+            className="text-xs px-2 py-1 rounded border border-amber-300 bg-white hover:bg-amber-100"
+            onClick={() => { onTrackingDomainChange(''); onDnsVerifyChange?.(false); }}
+          >
+            Clear saved domain
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default function Inboxes() {
+  const [inboxes, setInboxes] = useState(() => apiCache.get('/inboxes') || []);
+  const [cnameTarget, setCnameTarget] = useState('');
+  const [customTrackingCnameUiEnabled, setCustomTrackingCnameUiEnabled] = useState(true);
+  // state used for both add and edit forms
+  const initialForm = {
+    provider: 'gmail',
+    email: '',
+    display_name: '',
+    max_emails_per_day: 50,
+    wait_minutes_between: 5,
+    max_jitter_seconds: 180,
+    tracking_domain: '',
+    ramp_up_enabled: false,
+    ramp_up_period_days: 42,
+    ramp_up_start: 1,
+    ramp_up_step_size: 1,
+  };
+  const [form, setForm] = useState(initialForm);
+  const [message, setMessage] = useState(null);
+  // Generic SMTP / IMAP credentials for the Add form (used when provider === 'smtp')
+  const initialSmtpForm = {
+    smtp_host: '',
+    smtp_port: 587,
+    smtp_username: '',
+    smtp_password: '',
+    smtp_use_tls: true,
+    smtp_use_ssl: false,
+    imap_host: '',
+    imap_port: 993,
+    imap_username: '',
+    imap_password: '',
+    imap_use_ssl: true,
+  };
+  const [smtpForm, setSmtpForm] = useState(initialSmtpForm);
+  // SMTP credentials for the Edit panel (loaded on demand per inbox)
+  const [editingSmtp, setEditingSmtp] = useState(null);
+  const [smtpTestMsg, setSmtpTestMsg] = useState(null);
+  // Staged diagnostic report for the inbox being edited (Diagnose button).
+  const [smtpDiagnose, setSmtpDiagnose] = useState(null);
+  const [smtpDiagnosing, setSmtpDiagnosing] = useState(false);
+  const [smtpSendTestTo, setSmtpSendTestTo] = useState('');
+  const [smtpSendTestBusy, setSmtpSendTestBusy] = useState(false);
+  const [smtpSendTestMsg, setSmtpSendTestMsg] = useState(null);
+  // "Send test email" reveals its recipient field only after the button click.
+  const [smtpShowSendTest, setSmtpShowSendTest] = useState(false);
+  // Same three, but for the Add Inbox panel (nothing saved yet → unfiled mode).
+  const [addSmtpDiagnose, setAddSmtpDiagnose] = useState(null);
+  const [addSmtpDiagnosing, setAddSmtpDiagnosing] = useState(false);
+  const [addSmtpSendTestTo, setAddSmtpSendTestTo] = useState('');
+  const [addSmtpSendTestBusy, setAddSmtpSendTestBusy] = useState(false);
+  const [addSmtpSendTestMsg, setAddSmtpSendTestMsg] = useState(null);
+  const [addSmtpShowSendTest, setAddSmtpShowSendTest] = useState(false);
+  const [oauthConfigured, setOauthConfigured] = useState(false);
+  const [redirectUri, setRedirectUri] = useState('');
+  const [o365Configured, setO365Configured] = useState(false);
+  const [o365RedirectUri, setO365RedirectUri] = useState('');
+  const [editing, setEditing] = useState(null); // inbox being edited
+  const [editDirty, setEditDirty] = useState(false);
+  const [showEditWarning, setShowEditWarning] = useState(false);
+  const [editWarningCloseSidebar, setEditWarningCloseSidebar] = useState(false);
+  const [editMsg, setEditMsg] = useState(null);
+  // Tracks the saved tracking domain at the moment editing opened, so we only
+  // require re-verification when the user actually changes the domain.
+  const editOriginalDomain = useRef('');
+  const [editDomainVerified, setEditDomainVerified] = useState(false);
+  const [beaconSetupUrl, setBeaconSetupUrl] = useState('');
+  const [beaconConnecting, setBeaconConnecting] = useState(false);
+  const [dnsAutoVerifyTrigger, setDnsAutoVerifyTrigger] = useState(0);
+  const [editTrackingMode, setEditTrackingMode] = useState('app');
+  const [addTrackingMode, setAddTrackingMode] = useState('app');
+  const [addDomainVerified, setAddDomainVerified] = useState(false);
+  const [showAdd, setShowAdd] = useState(false); // controls add modal
+  const confirm = useConfirm();
+  const addBackdropDown = useRef(false);
+  const notify = useNotify();
+  const { mode } = useAppMode();
+  /** Development-only: count of open/click/unsub rows synced to Beacon on connect (from server). */
+  const [devBeaconRegCount, setDevBeaconRegCount] = useState(null);
+
+  useEffect(() => {
+    if (!editing?.id || mode !== 'development') {
+      setDevBeaconRegCount(null);
+      return;
+    }
+    let cancelled = false;
+    api
+      .get(`/inboxes/${editing.id}/beacon/pending-registration-count`)
+      .then((d) => {
+        if (!cancelled) setDevBeaconRegCount(typeof d.count === 'number' ? d.count : null);
+      })
+      .catch(() => {
+        if (!cancelled) setDevBeaconRegCount(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [editing?.id, mode]);
+
+  // ---- Pause modal state ----
+  const [showPauseModal, setShowPauseModal] = useState(false);
+  const [pausingInbox, setPausingInbox] = useState(null);
+  const [pauseAction, setPauseAction] = useState('pause_leads');
+
+  // ---- Detail panel state ----
+  const [selectedInbox, setSelectedInbox] = useState(null);
+
+  // ---- Token expiry visual indicator (from system health data) ----
+  const { rawData } = useSystemHealth();
+  const expiredInboxIds = useMemo(() => {
+    if (!rawData) return new Set();
+    const ids = new Set();
+    for (const acc of [...(rawData.google_oauth?.accounts || []), ...(rawData.microsoft_oauth?.accounts || [])]) {
+      if (acc.token_status === 'expired' && acc.inbox_id != null) {
+        ids.add(acc.inbox_id);
+      }
+    }
+    return ids;
+  }, [rawData]);
+
+  // Auto-open inbox detail panel when ?inbox=<id> is in the URL
+  const autoOpenHandledRef = useRef(false);
+
+  // ---- Polling after connect URL generation ----
+  const pollingTimerRef = useRef(null);
+  const knownInboxIdsRef = useRef(new Set());
+  const startPolling = () => {
+    knownInboxIdsRef.current = new Set(inboxes.map(i => i.id));
+    pollingTimerRef.current = setInterval(async () => {
+      try {
+        const fresh = await api.get('/inboxes');
+        const freshIds = new Set(fresh.map(i => i.id));
+        for (const id of freshIds) {
+          if (!knownInboxIdsRef.current.has(id)) {
+            notify({ type: 'success', message: 'New inbox connected!' });
+            setInboxes(fresh);
+            clearInterval(pollingTimerRef.current);
+            pollingTimerRef.current = null;
+            return;
+          }
+        }
+      } catch { /* polling errors are safe to ignore */ }
+    }, 3000);
+    setTimeout(() => {
+      if (pollingTimerRef.current) {
+        clearInterval(pollingTimerRef.current);
+        pollingTimerRef.current = null;
+      }
+    }, 300000);
+  };
+
+  const load = async () => {
+    try {
+      const data = await api.get('/inboxes');
+      setInboxes(data);
+      setSelectedInbox(prev => prev ? (data.find(i => i.id === prev.id) || null) : null);
+    } catch (e) {
+      console.error(e);
+    }
+  };
+  useEffect(() => {
+    load();
+    // check Gmail OAuth
+    fetch('/api/gmail/status')
+      .then(r => r.json())
+      .then(d => {
+        setOauthConfigured(d.configured);
+        setRedirectUri(d.redirect_uri || '');
+      })
+      .catch(() => {});
+    // check Office 365 OAuth
+    fetch('/api/office365/status')
+      .then(r => r.json())
+      .then(d => {
+        setO365Configured(d.configured);
+        setO365RedirectUri(d.redirect_uri || '');
+      })
+      .catch(() => {});
+    // get server hostname for DNS instructions
+    fetch('/api/settings/server-info')
+      .then(r => r.json())
+      .then((d) => {
+        setCnameTarget(d.cname_target || window.location.hostname);
+        if (typeof d.custom_tracking_cname_ui_enabled === 'boolean') {
+          setCustomTrackingCnameUiEnabled(d.custom_tracking_cname_ui_enabled);
+        }
+      })
+      .catch(() => setCnameTarget(window.location.hostname));
+  }, []);
+
+  // Clean up polling timer on unmount
+  useEffect(() => () => {
+    if (pollingTimerRef.current) {
+      clearInterval(pollingTimerRef.current);
+    }
+  }, []);
+
+  // Toast for ?connected=email from OAuth callback redirect (standard auth flow)
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const connectedEmail = params.get('connected');
+    if (connectedEmail) {
+      notify({ type: 'success', message: `Connected ${connectedEmail}` });
+      const clean = window.location.pathname + window.location.hash;
+      window.history.replaceState({}, '', clean);
+    }
+  }, [notify]);
+
+  // Open inbox detail panel when ?inbox=<id> is in the URL (from System Health "Fix it" link)
+  useEffect(() => {
+    if (autoOpenHandledRef.current) return;
+    const params = new URLSearchParams(window.location.search);
+    const inboxId = params.get('inbox');
+    if (!inboxId) return;
+    const numId = Number(inboxId);
+    if (!Number.isFinite(numId)) return;
+    const inbox = inboxes.find(i => i.id === numId);
+    if (inbox) {
+      autoOpenHandledRef.current = true;
+      setSelectedInbox(inbox);
+      if (editing) closeEdit();
+      const clean = window.location.pathname + window.location.hash;
+      window.history.replaceState({}, '', clean);
+    }
+  }, [inboxes]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleChange = (e) => {
+    const { name, value, type } = e.target;
+    // A fill-in-the-blanks error is stale the moment the operator types.
+    if (message?.type === 'error') setMessage(null);
+    setForm(f => ({ ...f, [name]: type === 'number' ? +value : value }));
+  };
+
+  const handleProviderChange = (e) => {
+    handleChange(e);
+  };
+
+  const canSubmit = () => {
+    if (form.provider === 'gmail' || form.provider === 'office365') {
+      // allow click so user receives an error message if OAuth is not configured
+      return true;
+    }
+    if (form.provider === 'smtp') {
+      return form.email.trim() !== '' && smtpForm.smtp_host.trim() !== '';
+    }
+    return form.email.trim() !== '';
+  };
+
+  const submitSmtp = async (inboxPayload, sendTestTo) => {
+    // 1. create the inbox row, 2. save credentials, 3. test the connection,
+    // 4. (optional) send a real test email to *sendTestTo*.
+    const created = await api.post('/inboxes', inboxPayload);
+    try {
+      await api.put(`/smtp/inboxes/${created.id}`, { ...smtpForm, smtp_port: +smtpForm.smtp_port, imap_port: +smtpForm.imap_port });
+    } catch (e) {
+      setMessage({ type: 'error', text: `Inbox created but SMTP credentials failed to save: ${e.message}` });
+      setForm(initialForm);
+      setSmtpForm(initialSmtpForm);
+      load();
+      setShowAdd(false);
+      return;
+    }
+    try {
+      const res = await api.post(`/smtp/inboxes/${created.id}/test`, {});
+      if (res.ok) {
+        setMessage({ type: 'success', text: 'SMTP inbox added and connection verified' });
+      } else {
+        const details = [res.smtp?.error, res.imap?.error].filter(Boolean).join(' ');
+        setMessage({ type: 'error', text: `Inbox added but connection test failed: ${details || 'unknown error'}` });
+      }
+    } catch (e) {
+      setMessage({ type: 'error', text: `Inbox added but connection test failed: ${e.message}` });
+    }
+
+    // Real send test from the create panel — the inbox exists now, so this
+    // exercises the exact campaign send path.
+    if (sendTestTo) {
+      try {
+        const sendRes = await api.post(`/smtp/inboxes/${created.id}/send-test`, { to_email: sendTestTo });
+        setAddSmtpSendTestMsg(
+          sendRes.ok
+            ? { type: 'success', text: `Test email accepted by the relay (${sendRes.message_id || 'sent'})` }
+            : { type: 'error', text: `Test send failed: ${sendRes.message || sendRes.error || 'unknown error'}` },
+        );
+      } catch (e) {
+        setAddSmtpSendTestMsg({ type: 'error', text: `Test send failed: ${e.message}` });
+      } finally {
+        setAddSmtpSendTestBusy(false);
+      }
+    }
+
+    setForm(initialForm);
+    setSmtpForm(initialSmtpForm);
+    setAddTrackingMode('app');
+    setAddDomainVerified(false);
+    setAddSmtpDiagnose(null);
+    load();
+    setShowAdd(false);
+  };
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setMessage(null);
+    if (form.provider === 'gmail') {
+      if (!oauthConfigured) {
+        setMessage({
+          type: 'error',
+          text: 'Google OAuth is not configured. Define GOOGLE_CLIENT_ID/SECRET in your environment and restart the server.',
+        });
+        return;
+      }
+      // redirect to Gmail OAuth
+      const params = new URLSearchParams({ display_name: form.display_name, max_per_day: form.max_emails_per_day, ramp_up_enabled: form.ramp_up_enabled ? 'true' : 'false', ramp_up_start: form.ramp_up_start, ramp_up_step_size: form.ramp_up_step_size });
+      window.location.href = '/oauth/google/authorize?' + params;
+      return;
+    }
+    if (form.provider === 'office365') {
+      if (!o365Configured) {
+        setMessage({
+          type: 'error',
+          text: 'Office 365 OAuth is not configured. Define OFFICE365_CLIENT_ID/SECRET/TENANT_ID in your environment and restart the server.',
+        });
+        return;
+      }
+      // redirect to Office 365 OAuth
+      const params = new URLSearchParams({ display_name: form.display_name, max_per_day: form.max_emails_per_day, ramp_up_enabled: form.ramp_up_enabled ? 'true' : 'false', ramp_up_start: form.ramp_up_start, ramp_up_step_size: form.ramp_up_step_size });
+      window.location.href = '/oauth/office365/authorize?' + params;
+      return;
+    }
+    if (form.provider === 'smtp') {
+      if (!form.email.trim()) {
+        setMessage({ type: 'error', text: 'Email address is required for SMTP inboxes.' });
+        return;
+      }
+      if (!smtpForm.smtp_host.trim() || !smtpForm.smtp_username.trim() || !smtpForm.smtp_password) {
+        setMessage({ type: 'error', text: 'SMTP host, username, and password are required.' });
+        return;
+      }
+      const addDomain = addTrackingMode === 'dns' ? form.tracking_domain.trim() : '';
+      if (addDomain && !addDomainVerified) {
+        setMessage({ type: 'error', text: 'Please verify the DNS tracking domain before saving.' });
+        return;
+      }
+      try {
+        await submitSmtp({ ...form, tracking_domain: addDomain || null });
+      } catch (e) {
+        setMessage({ type: 'error', text: e.message });
+      }
+      return;
+    }
+    const addDomain = addTrackingMode === 'dns' ? form.tracking_domain.trim() : '';
+    if (addDomain && !addDomainVerified) {
+      setMessage({ type: 'error', text: 'Please verify the DNS tracking domain before saving.' });
+      return;
+    }
+    try {
+      await api.post('/inboxes', {
+        ...form,
+        tracking_domain: addDomain || null,
+      });
+      setMessage({ type: 'success', text: 'Inbox added' });
+      setForm(initialForm);
+      setAddTrackingMode('app');
+      setAddDomainVerified(false);
+      load();
+      setShowAdd(false);
+    } catch (e) {
+      setMessage({ type: 'error', text: e.message });
+    }
+  };
+
+  const openEdit = (inbox) => {
+    setEditing({ ...inbox });
+    setEditDirty(false);
+    setEditMsg(null);
+    setEditingSmtp(null);
+    setSmtpTestMsg(null);
+    setSmtpDiagnose(null);
+    setSmtpSendTestMsg(null);
+    setSmtpShowSendTest(false);
+    if (inbox.provider === 'smtp') {
+      api.get(`/smtp/inboxes/${inbox.id}`)
+        .then((d) => setEditingSmtp({
+          smtp_host: d.smtp_host || '',
+          smtp_port: d.smtp_port || 587,
+          smtp_username: d.smtp_username || '',
+          smtp_password: '',
+          smtp_use_tls: d.smtp_use_tls !== false,
+          smtp_use_ssl: !!d.smtp_use_ssl,
+          imap_host: d.imap_host || '',
+          imap_port: d.imap_port || 993,
+          imap_username: d.imap_username || '',
+          imap_password: '',
+          imap_use_ssl: d.imap_use_ssl !== false,
+          _meta: d,
+        }))
+        .catch(() => setEditingSmtp({
+          smtp_host: '', smtp_port: 587, smtp_username: '', smtp_password: '',
+          smtp_use_tls: true, smtp_use_ssl: false,
+          imap_host: '', imap_port: 993, imap_username: '', imap_password: '',
+          imap_use_ssl: true, _meta: null,
+        }));
+    }
+    editOriginalDomain.current = inbox.tracking_domain || '';
+    setEditDomainVerified(false);
+    setBeaconSetupUrl('');
+    setDnsAutoVerifyTrigger(0);
+    setEditTrackingMode(
+      inbox.beacon_connected
+        ? 'beacon'
+        : (customTrackingCnameUiEnabled && (inbox.tracking_domain || '').trim() ? 'dns' : 'app'),
+    );
+  };
+  const closeEdit = () => {
+    setEditing(null);
+    setEditDirty(false);
+    setEditingSmtp(null);
+    setSmtpTestMsg(null);
+    setSmtpDiagnose(null);
+    setSmtpSendTestMsg(null);
+    setSmtpShowSendTest(false);
+  };
+  const tryCloseEdit = () => {
+    if (editDirty) {
+      setEditWarningCloseSidebar(false);
+      setShowEditWarning(true);
+    } else {
+      closeEdit();
+    }
+  };
+  const tryCloseSidebar = () => {
+    if (editing && editDirty) {
+      setEditWarningCloseSidebar(true);
+      setShowEditWarning(true);
+    } else {
+      closeEdit();
+      setSelectedInbox(null);
+    }
+  };
+  const applyEditTrackingMode = (mode) => {
+    if (!editing) return;
+    if (editing.beacon_connected && mode !== 'beacon') {
+      setEditMsg({ type: 'error', text: 'Disconnect Beacon before choosing another tracking option.' });
+      return;
+    }
+    setEditMsg(null);
+    setEditTrackingMode(mode);
+    if (mode === 'app' || mode === 'beacon') {
+      setEditing(prev => ({ ...prev, tracking_domain: '' }));
+      setEditDomainVerified(false);
+    }
+    setEditDirty(true);
+  };
+
+  const applyAddTrackingMode = (mode) => {
+    setAddTrackingMode(mode);
+    if (mode === 'app' || mode === 'beacon') {
+      setForm(f => ({ ...f, tracking_domain: '' }));
+      setAddDomainVerified(false);
+    }
+  };
+
+  const doSave = async () => {
+    if (!editing) return;
+    const newDomain = editTrackingMode === 'dns' ? (editing.tracking_domain || '').trim() : '';
+    const domainChanged = newDomain !== editOriginalDomain.current;
+    if (editTrackingMode === 'dns' && newDomain && domainChanged && !editDomainVerified) {
+      setEditMsg({ type: 'error', text: 'Please verify the DNS tracking domain before saving.' });
+      return;
+    }
+    // SMTP credentials are part of this form now — validate before saving so the
+    // user gets one clear error instead of a half-saved inbox.
+    if (editing.provider === 'smtp' && editingSmtp) {
+      if (!editingSmtp.smtp_host.trim() || !editingSmtp.smtp_username.trim()) {
+        setEditMsg({ type: 'error', text: 'SMTP host and username are required.' });
+        return;
+      }
+      if (!editingSmtp.smtp_password && !editingSmtp._meta?.has_smtp_password) {
+        setEditMsg({ type: 'error', text: 'SMTP password is required.' });
+        return;
+      }
+    }
+    setEditDirty(false); // save in progress — don't treat as unsaved
+    try {
+      const body = {
+        display_name: editing.display_name,
+        provider: editing.provider,
+        max_emails_per_day: editing.max_emails_per_day,
+        wait_minutes_between: editing.wait_minutes_between,
+        max_jitter_seconds: clampJitterSeconds(editing.max_jitter_seconds ?? 180),
+        tracking_domain: newDomain || null,
+        ramp_up_enabled: editing.ramp_up_enabled,
+        ramp_up_period_days: editing.ramp_up_period_days,
+        ramp_up_start: editing.ramp_up_start ?? 1,
+        ramp_up_step_size: editing.ramp_up_step_size ?? 1,
+      };
+      await api.patch(`/inboxes/${editing.id}`, body);
+      // Persist SMTP/IMAP credentials with the same click (the panel has a
+      // single Save). An empty password means "keep stored".
+      if (editing.provider === 'smtp' && editingSmtp) {
+        const { _meta, ...payload } = editingSmtp;
+        const saved = await api.put(`/smtp/inboxes/${editing.id}`, {
+          ...payload, smtp_port: +payload.smtp_port, imap_port: +payload.imap_port,
+        });
+        setEditingSmtp((prev) => ({ ...prev, smtp_password: '', imap_password: '', _meta: saved }));
+      }
+      setEditMsg({ type: 'success', text: 'Inbox updated' });
+      setTimeout(() => { closeEdit(); load(); }, 1000);
+    } catch (err) {
+      setEditMsg({ type: 'error', text: err.message });
+    }
+  };
+  const saveEdit = async (e) => {
+    e.preventDefault();
+    await doSave();
+  };
+
+  const runSmtpDiagnose = async ({ throwOnError = false } = {}) => {
+    if (!editing) return;
+    setSmtpDiagnosing(true);
+    setSmtpTestMsg(null);
+    setSmtpDiagnose(null);
+    try {
+      const report = await api.post(`/smtp/inboxes/${editing.id}/diagnose`, {});
+      setSmtpDiagnose(report);
+      await refreshEditingInbox(editing.id);
+    } catch (err) {
+      setSmtpTestMsg({ type: 'error', text: err.message });
+      // The Diagnose button reports inline; the suggested-mode retry needs the
+      // 429 to bubble up so it can wait out the cooldown and try once more.
+      if (throwOnError) throw err;
+    } finally {
+      setSmtpDiagnosing(false);
+    }
+  };
+
+  const sendSmtpTestEmail = async (toOverride) => {
+    if (!editing) return;
+    const to = ((toOverride ?? smtpSendTestTo) || '').trim();
+    if (!to || !to.includes('@')) {
+      setSmtpSendTestMsg({ type: 'error', text: 'Enter a recipient email address.' });
+      return;
+    }
+    setSmtpSendTestBusy(true);
+    setSmtpSendTestMsg(null);
+    try {
+      const res = await api.post(`/smtp/inboxes/${editing.id}/send-test`, { to_email: to });
+      if (res.ok) {
+        setSmtpSendTestMsg({ type: 'success', text: `Test email accepted by the relay (${res.message_id || 'sent'})` });
+      } else {
+        setSmtpSendTestMsg({ type: 'error', text: `Test send failed: ${res.message || res.error || 'unknown error'}` });
+      }
+      await refreshEditingInbox(editing.id);
+    } catch (err) {
+      setSmtpSendTestMsg({ type: 'error', text: err.message });
+    } finally {
+      setSmtpSendTestBusy(false);
+    }
+  };
+
+  // The edit-panel Diagnose probes the SAVED account, so tell the user when
+  // what they see on screen is not what will be tested.
+  const smtpFormDirty = (() => {
+    const m = editingSmtp?._meta;
+    if (!m) return false;
+    const s = editingSmtp;
+    return (
+      (s.smtp_host || '') !== (m.smtp_host || '')
+      || +s.smtp_port !== +m.smtp_port
+      || (s.smtp_username || '') !== (m.smtp_username || '')
+      || !!s.smtp_use_tls !== !!m.smtp_use_tls
+      || !!s.smtp_use_ssl !== !!m.smtp_use_ssl
+      || (s.imap_host || '') !== (m.imap_host || '')
+      || +s.imap_port !== +m.imap_port
+      || (s.imap_username || '') !== (m.imap_username || '')
+      || !!s.imap_use_ssl !== !!m.imap_use_ssl
+      || !!(s.smtp_password || s.imap_password)
+    );
+  })();
+
+  /** Apply the mode the diagnostic proved works, save it, and re-test. */
+  const applySuggestedMode = async (mode) => {
+    if (!editingSmtp || !editing) return;
+    const next = {
+      ...editingSmtp,
+      smtp_use_ssl: mode === 'ssl',
+      smtp_use_tls: mode === 'starttls',
+    };
+    setEditingSmtp(next);
+    setSmtpDiagnose(null);
+    setSmtpTestMsg(null);
+    try {
+      const { _meta, ...payload } = next;
+      const saved = await api.put(`/smtp/inboxes/${editing.id}`, {
+        ...payload,
+        smtp_port: +payload.smtp_port,
+        imap_port: +payload.imap_port,
+      });
+      setEditingSmtp((prev) => ({ ...prev, smtp_password: '', imap_password: '', _meta: saved }));
+      // Re-diagnose right away. The first probe set a cooldown a few seconds
+      // ago, so a 429 here is expected — retry once after the window instead
+      // of surfacing a raw JSON error. runSmtpDiagnose reports errors inline by
+      // default, so ask it to rethrow.
+      try {
+        await runSmtpDiagnose({ throwOnError: true });
+      } catch (err) {
+        if (err?.retryAfter || err?.status === 429) {
+          await new Promise((r) => setTimeout(r, (err.retryAfter || 21) * 1000));
+          await runSmtpDiagnose({ throwOnError: true });
+        } else {
+          throw err;
+        }
+      }
+    } catch (err) {
+      setSmtpTestMsg({ type: 'error', text: err.message });
+    }
+  };
+
+  // ── Add-panel diagnostics ──────────────────────────────────────────────
+  // The inbox does not exist yet, so these run the probe against the typed
+  // credentials only (nothing is persisted, and a test send is not possible).
+  // Returns the labels of whatever is still missing, so the button can spell
+  // out exactly what to fill in instead of silently doing nothing.
+  const addSmtpMissingFields = () => {
+    const missing = [];
+    if (!form.email.trim()) missing.push('the From email address');
+    if (!smtpForm.smtp_host.trim()) missing.push('the SMTP host');
+    if (!smtpForm.smtp_username.trim()) missing.push('the SMTP username');
+    if (!smtpForm.smtp_password) missing.push('the SMTP password');
+    if (smtpForm.imap_host.trim() && !smtpForm.imap_password) {
+      missing.push('the IMAP password (IMAP host is set)');
+    }
+    return missing;
+  };
+
+  const runAddSmtpDiagnose = async () => {
+    const missing = addSmtpMissingFields();
+    if (missing.length > 0) {
+      // Keep the message on screen next to the form (the modal is a plain form;
+      // ``message`` renders at the top) and disable the button while it shows.
+      setMessage({
+        type: 'error',
+        text: `Enter ${missing.join(', ')} before running Diagnose.`,
+      });
+      return;
+    }
+    setMessage(null);
+    setAddSmtpDiagnosing(true);
+    setAddSmtpDiagnose(null);
+    setSmtpTestMsg(null);
+    try {
+      const report = await api.post('/smtp/diagnose', {
+        smtp_host: smtpForm.smtp_host,
+        smtp_port: +smtpForm.smtp_port,
+        smtp_username: smtpForm.smtp_username,
+        smtp_password: smtpForm.smtp_password,
+        smtp_use_tls: !!smtpForm.smtp_use_tls,
+        smtp_use_ssl: !!smtpForm.smtp_use_ssl,
+        imap_host: smtpForm.imap_host.trim(),
+        imap_port: +smtpForm.imap_port,
+        imap_username: smtpForm.imap_username.trim(),
+        imap_password: smtpForm.imap_password,
+        imap_use_ssl: !!smtpForm.imap_use_ssl,
+      });
+      setAddSmtpDiagnose(report);
+    } catch (err) {
+      setMessage({ type: 'error', text: err.message });
+    } finally {
+      setAddSmtpDiagnosing(false);
+    }
+  };
+
+  const applySuggestedModeAdd = (mode) => {
+    setSmtpForm((prev) => ({
+      ...prev,
+      smtp_use_ssl: mode === 'ssl',
+      smtp_use_tls: mode === 'starttls',
+    }));
+    setAddSmtpDiagnose(null);
+    setMessage(null);
+  };
+
+  const refreshEditingInbox = async (inboxId) => {
+    const data = await api.get('/inboxes');
+    setInboxes(data);
+    const fresh = data.find((i) => i.id === inboxId);
+    if (fresh) {
+      setEditing({ ...fresh });
+      editOriginalDomain.current = fresh.tracking_domain || '';
+      setSelectedInbox((prev) => (prev?.id === fresh.id ? fresh : prev));
+    }
+  };
+
+  const connectBeacon = async () => {
+    if (!editing) return;
+    const url = beaconSetupUrl.trim();
+    if (!url) {
+      setEditMsg({ type: 'error', text: 'Paste the full Beacon setup URL (includes ?token=…).' });
+      return;
+    }
+    setBeaconConnecting(true);
+    try {
+      await api.post(`/inboxes/${editing.id}/beacon/connect`, { setup_url: url });
+      setEditMsg({ type: 'success', text: 'Beacon connected. Custom Caddy tracking domain was cleared.' });
+      setBeaconSetupUrl('');
+      setEditTrackingMode('beacon');
+      await refreshEditingInbox(editing.id);
+    } catch (err) {
+      setEditMsg({ type: 'error', text: err.message });
+    } finally {
+      setBeaconConnecting(false);
+    }
+  };
+
+  const connectBeaconFromSibling = async (sourceInboxId) => {
+    if (!editing) return;
+    setBeaconConnecting(true);
+    setEditMsg(null);
+    try {
+      await api.post(`/inboxes/${editing.id}/beacon/connect-from`, { source_inbox_id: sourceInboxId });
+      setEditMsg({ type: 'success', text: 'Beacon connected using another inbox’s tracker.' });
+      setBeaconSetupUrl('');
+      setEditTrackingMode('beacon');
+      await refreshEditingInbox(editing.id);
+    } catch (err) {
+      setEditMsg({ type: 'error', text: err.message });
+    } finally {
+      setBeaconConnecting(false);
+    }
+  };
+
+  const reuseDnsFromSibling = (domain) => {
+    if (!editing || editing.beacon_connected) return;
+    const d = (domain || '').trim();
+    if (!d) return;
+    setEditMsg(null);
+    setEditTrackingMode('dns');
+    setEditing((prev) => ({ ...prev, tracking_domain: d }));
+    setEditDomainVerified(false);
+    setEditDirty(true);
+    setDnsAutoVerifyTrigger((n) => n + 1);
+  };
+
+  const disconnectBeacon = async () => {
+    if (!editing) return;
+    const ok = await confirm(
+      customTrackingCnameUiEnabled
+        ? 'Disconnect Beacon? Tracking links will use the app domain or a custom CNAME domain again.'
+        : 'Disconnect Beacon? Tracking links will use the app domain until you connect Beacon again or clear any legacy domain.',
+    );
+    if (!ok) return;
+    try {
+      await api.post(`/inboxes/${editing.id}/beacon/disconnect`);
+      setEditMsg({ type: 'success', text: 'Beacon disconnected.' });
+      setEditTrackingMode('app');
+      await refreshEditingInbox(editing.id);
+    } catch (err) {
+      setEditMsg({ type: 'error', text: err.message });
+    }
+  };
+
+  // Escape to close modals
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key !== 'Escape') return;
+      if (showEditWarning) { setShowEditWarning(false); }
+      else if (showAdd) { setShowAdd(false); setMessage(null); setAddTrackingMode('app'); setAddSmtpDiagnose(null); setAddSmtpSendTestMsg(null); setAddSmtpShowSendTest(false); }
+      else if (editing) tryCloseEdit();
+      else if (selectedInbox) setSelectedInbox(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [showEditWarning, showAdd, editing]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const deleteInbox = async (id, email) => {
+    const ok = await confirm(`Delete inbox "${email}"?`);
+    if (!ok) return;
+
+    const tryDelete = async (reassign = false) => {
+      const url = `/inboxes/${id}` + (reassign ? '?reassign=true' : '');
+      // helper exposes `del` method for DELETE
+      await api.del(url);
+    };
+
+    try {
+      await tryDelete();
+      notify({ type: 'success', message: `Inbox "${email}" deleted` });
+      load();
+    } catch (e) {
+      const msg = e.message || '';
+      if (msg.includes('assigned to one or more campaigns') || msg.includes('pending queue slots')) {
+        const again = await confirm(
+          'Inbox is currently in use.\n' +
+          'Assigned leads will be reassigned to other inboxes.'
+        );
+        if (again) {
+          try {
+            await tryDelete(true);
+            notify({ type: 'success', message: `Inbox "${email}" paused & deleted` });
+            load();
+            return;
+          } catch (e2) {
+            notify({ type: 'error', message: 'Error deleting inbox after reassign: ' + e2.message });
+            return;
+          }
+        }
+      }
+      notify({ type: 'error', message: 'Error deleting inbox: ' + msg });
+    }
+  };
+
+  const openPauseModal = async (inbox) => {
+    if (!inbox.pending_leads) {
+      // No pending leads to handle — pause silently without a dialog
+      try {
+        await api.post(`/inboxes/${inbox.id}/pause`, { action: 'pause_leads' });
+        notify({ type: 'success', message: `Inbox "${inbox.email}" paused` });
+        load();
+      } catch (e) {
+        notify({ type: 'error', message: 'Error pausing inbox: ' + e.message });
+      }
+      return;
+    }
+    setPausingInbox(inbox);
+    setPauseAction('reassign');
+    setShowPauseModal(true);
+  };
+
+  const confirmPause = async () => {
+    if (!pausingInbox) return;
+    try {
+      await api.post(`/inboxes/${pausingInbox.id}/pause`, {
+        action: pauseAction,
+      });
+      notify({ type: 'success', message: `Inbox "${pausingInbox.email}" paused` });
+      setShowPauseModal(false);
+      load();
+    } catch (e) {
+      notify({ type: 'error', message: 'Error pausing inbox: ' + e.message });
+    }
+  };
+
+  const resumeInbox = async (id, email) => {
+    try {
+      await api.post(`/inboxes/${id}/unpause`, {});
+      notify({ type: 'success', message: `Inbox "${email}" resumed` });
+      load();
+    } catch (e) {
+      notify({ type: 'error', message: 'Error resuming inbox: ' + e.message });
+    }
+  };
+
+  const reconnectInbox = (inbox) => {
+    const params = new URLSearchParams({
+      display_name: inbox.display_name || '',
+      max_per_day: inbox.max_emails_per_day,
+      ramp_up_enabled: inbox.ramp_up_enabled ? 'true' : 'false',
+    });
+    if (inbox.provider === 'gmail') {
+      window.location.href = '/oauth/google/authorize?' + params;
+    } else if (inbox.provider === 'office365') {
+      window.location.href = '/oauth/office365/authorize?' + params;
+    }
+  };
+
+  const generateConnectUrlForForm = async () => {
+    setMessage(null);
+    try {
+      const res = await api.post('/oauth/connect-url', {
+        provider: form.provider,
+        display_name: form.display_name,
+        max_per_day: form.max_emails_per_day,
+        wait_minutes_between: form.wait_minutes_between,
+        max_jitter_seconds: form.max_jitter_seconds,
+        tracking_domain: form.tracking_domain || '',
+        ramp_up_enabled: form.ramp_up_enabled,
+        ramp_up_start: form.ramp_up_start,
+        ramp_up_step_size: form.ramp_up_step_size,
+      });
+      await navigator.clipboard.writeText(res.url);
+      startPolling();
+      setShowAdd(false);
+      setForm(initialForm);
+      setAddTrackingMode('app');
+      setMessage(null);
+      notify({
+        type: 'success',
+        message: `Connect URL copied! The page will auto-detect when the inbox is connected.`,
+      });
+    } catch (e) {
+      setMessage({ type: 'error', text: e.message });
+    }
+  };
+
+  const generateConnectUrlForInbox = async (inbox) => {
+    try {
+      const res = await api.post(`/inboxes/${inbox.id}/generate-connect-url`);
+      await navigator.clipboard.writeText(res.url);
+      startPolling();
+      notify({
+        type: 'success',
+        message: `Connect URL copied! This page will auto-detect when the inbox is connected.`,
+      });
+    } catch (e) {
+      notify({ type: 'error', message: e.message });
+    }
+  };
+
+  return (
+    <div className="min-h-0 flex-1 overflow-y-auto p-8">
+      {/* header with add button */}
+      <div className="flex justify-between items-center mb-4">
+        <h1 className="text-2xl font-bold">Inboxes</h1>
+        <Button variant="default" onClick={() => { setForm(initialForm); setSmtpForm(initialSmtpForm); setAddTrackingMode('app'); setMessage(null); setAddSmtpDiagnose(null); setAddSmtpSendTestMsg(null); setAddSmtpSendTestTo(''); setAddSmtpShowSendTest(false); setShowAdd(true); }}>
+          Add Inbox
+        </Button>
+      </div>
+
+      {inboxes.length === 0 && (
+        <div className="flex flex-col items-center justify-center py-16 text-center">
+          <div className="w-14 h-14 rounded-full bg-gray-100 flex items-center justify-center mb-4">
+            <svg className="w-7 h-7 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+            </svg>
+          </div>
+          <p className="text-gray-500 text-sm">No inboxes yet. Click <span className="font-medium text-gray-700">Add Inbox</span> to get started.</p>
+        </div>
+      )}
+      {inboxes.length > 0 && (
+        <div className="flex gap-5 items-start" style={{ alignItems: 'flex-start' }}>
+          {/* ── Inbox card list ── */}
+          <div className="flex-1 min-w-0 space-y-2">
+            {inboxes.map(inbox => {
+              const isSelected = selectedInbox?.id === inbox.id;
+              const sentToday = inbox.sent_today || 0;
+              const maxToday = inbox.effective_max_per_day || inbox.max_emails_per_day;
+              const warmupActive = inbox.ramp_up_enabled && inbox.effective_max_per_day < inbox.max_emails_per_day;
+              const avatarLetter = (inbox.email || inbox.display_name || 'I')[0].toUpperCase();
+              return (
+                <button
+                  key={inbox.id}
+                  onClick={() => { if (isSelected) { tryCloseSidebar(); } else { setSelectedInbox(inbox); } }}
+                  className={`w-full text-left rounded-xl border px-5 py-4 transition-all duration-150 focus:outline-none focus:ring-2 focus:ring-blue-400 ${
+                    isSelected
+                      ? 'border-blue-400 bg-blue-50 shadow-sm'
+                      : 'border-gray-200 bg-white hover:border-gray-300 hover:shadow-sm'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-4">
+                    {/* Left: avatar + email */}
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="w-9 h-9 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-white text-sm font-semibold shrink-0">
+                        {avatarLetter}
+                      </div>
+                      <div className="min-w-0">
+                        <p className="font-medium text-gray-900 text-sm leading-tight truncate">
+                          {inbox.email || '(Connected account)'}
+                        </p>
+                        {inbox.display_name && (
+                          <p className="text-xs text-gray-500 leading-tight mt-0.5 truncate">{inbox.display_name}</p>
+                        )}
+                      </div>
+                    </div>
+                    {/* Right: badges + sent count */}
+                    <div className="flex items-center gap-2 shrink-0">
+                      {warmupActive && (
+                        <span className="text-xs bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full font-medium">
+                          Stage {inbox.effective_max_per_day}/{inbox.max_emails_per_day}
+                        </span>
+                      )}
+                      <span className="text-xs text-gray-500">
+                        <span className="font-semibold text-gray-800">{sentToday}</span>
+                        <span className="text-gray-400"> / {maxToday} sent</span>
+                      </span>
+                      {inbox.paused
+                        ? <span className="text-xs bg-orange-100 text-orange-700 px-2 py-0.5 rounded-full font-medium">Paused</span>
+                        : inbox.health === 'failing'
+                          ? <span className="text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded-full font-medium" title={inbox.last_send_error || ''}>Failing</span>
+                          : inbox.provider === 'smtp' && inbox.health === 'unknown'
+                            ? <span className="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full font-medium">Unknown</span>
+                            : <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full font-medium">Active</span>
+                      }
+                      {expiredInboxIds.has(inbox.id) && (
+                        <span className="text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded-full font-medium">
+                          Token Expired
+                        </span>
+                      )}
+                      <svg className={`w-4 h-4 text-gray-400 transition-transform duration-200 ${isSelected ? 'rotate-90' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                      </svg>
+                    </div>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* ── Detail panel ── */}
+          {selectedInbox && (
+            <div className="w-[min(28rem,calc(100vw-2.5rem))] shrink-0 bg-white border border-gray-200 rounded-xl shadow-sm flex flex-col overflow-hidden sticky top-4" style={{ maxHeight: 'calc(100vh - 8rem)' }}>
+              {editing && editing.id === selectedInbox.id ? (
+                <>
+                  {/* Edit panel header */}
+                  <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+                    <h3 className="font-semibold text-gray-900 text-sm">Edit Inbox</h3>
+                    <button
+                      onClick={tryCloseEdit}
+                      className="shrink-0 w-7 h-7 flex items-center justify-center rounded-lg text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors"
+                      aria-label="Cancel edit"
+                    >
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                      </svg>
+                    </button>
+                  </div>
+
+                  {/* Edit form */}
+                  <div className="px-5 py-4 overflow-y-auto flex-1 min-w-0">
+                    {editMsg && <div className={`mb-3 text-sm ${editMsg.type === 'error' ? 'text-red-600' : 'text-green-600'}`}>{editMsg.text}</div>}
+                    {/* Token expired banner */}
+                    {expiredInboxIds.has(editing.id) && (
+                      <div className="mb-3 p-3 bg-red-50 border border-red-200 rounded-lg flex items-start gap-2">
+                        <svg className="w-4 h-4 text-red-500 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                        <p className="text-sm text-red-700">Token expired — reconnect this account from the detail panel.</p>
+                      </div>
+                    )}
+                    <form onSubmit={saveEdit} className="space-y-4 min-w-0 max-w-full">
+                      <div>
+                        <label className="block text-xs font-medium text-gray-700">Email (read-only)</label>
+                        <input type="email" value={editing.email} disabled className="mt-1 block w-full border-gray-300 rounded-md bg-gray-100 text-sm" />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-gray-700">Display name</label>
+                        <input type="text" name="display_name" value={editing.display_name || ''} onChange={e => { setEditing(prev => ({ ...prev, display_name: e.target.value })); setEditDirty(true); }} className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-gray-700">Provider</label>
+                        <select name="provider" value={editing.provider || 'gmail'} className="mt-1 block w-full border-gray-300 rounded-md bg-gray-100 text-sm" disabled>
+                          <option value="gmail">Gmail / Google Workspace</option>
+                          <option value="office365">Office 365 / Outlook</option>
+                          <option value="smtp">SMTP (any provider)</option>
+                        </select>
+                      </div>
+                      {editing.provider === 'gmail' && <RedirectUriBlock uri={redirectUri} />}
+                      {editing.provider === 'office365' && <RedirectUriBlock uri={o365RedirectUri} />}
+                      {editing.provider === 'smtp' && (
+                        <div className="border rounded p-3 space-y-3 bg-gray-50 min-w-0 max-w-full overflow-hidden">
+                          <p className="text-xs font-medium text-gray-500 uppercase tracking-wide">SMTP / IMAP</p>
+                          {smtpTestMsg && <div className={`text-sm ${smtpTestMsg.type === 'error' ? 'text-red-600' : 'text-green-600'}`}>{smtpTestMsg.text}</div>}
+                          {!editingSmtp ? (
+                            <p className="text-xs text-gray-400">Loading SMTP settings…</p>
+                          ) : (
+                            <>
+                              <div className="grid grid-cols-3 gap-2">
+                                <div className="col-span-2">
+                                  <label className="block text-xs font-medium text-gray-700">SMTP host</label>
+                                  <input type="text" value={editingSmtp.smtp_host} onChange={e => setEditingSmtp(prev => ({ ...prev, smtp_host: e.target.value }))} className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
+                                </div>
+                                <div>
+                                  <label className="block text-xs font-medium text-gray-700">Port</label>
+                                  <input type="number" value={editingSmtp.smtp_port} onChange={e => setEditingSmtp(prev => ({ ...prev, smtp_port: +e.target.value }))} min={1} max={65535} className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
+                                </div>
+                              </div>
+                              <div>
+                                <label className="block text-xs font-medium text-gray-700">SMTP username</label>
+                                <input type="text" value={editingSmtp.smtp_username} onChange={e => setEditingSmtp(prev => ({ ...prev, smtp_username: e.target.value }))} autoComplete="off" className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
+                              </div>
+                              <div>
+                                <label className="block text-xs font-medium text-gray-700">SMTP password {editingSmtp._meta?.has_smtp_password && <span className="text-gray-400 font-normal">(saved — re-enter to change)</span>}</label>
+                                <input type="password" value={editingSmtp.smtp_password} onChange={e => setEditingSmtp(prev => ({ ...prev, smtp_password: e.target.value }))} autoComplete="new-password" placeholder={editingSmtp._meta?.has_smtp_password ? '••••••••' : ''} className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
+                              </div>
+                              <div className="flex gap-4 text-sm text-gray-700">
+                                <label className="flex items-center gap-1.5 cursor-pointer text-xs">
+                                  <input type="checkbox" checked={!!editingSmtp.smtp_use_tls} onChange={e => setEditingSmtp(prev => ({ ...prev, smtp_use_tls: e.target.checked, smtp_use_ssl: e.target.checked ? false : prev.smtp_use_ssl }))} />
+                                  STARTTLS (587)
+                                </label>
+                                <label className="flex items-center gap-1.5 cursor-pointer text-xs">
+                                  <input type="checkbox" checked={!!editingSmtp.smtp_use_ssl} onChange={e => setEditingSmtp(prev => ({ ...prev, smtp_use_ssl: e.target.checked, smtp_use_tls: e.target.checked ? false : prev.smtp_use_tls }))} />
+                                  SSL (465)
+                                </label>
+                              </div>
+                              <div>
+                                <label className="block text-xs font-medium text-gray-700">IMAP host (optional — reply sync)</label>
+                                <input type="text" value={editingSmtp.imap_host} onChange={e => setEditingSmtp(prev => ({ ...prev, imap_host: e.target.value }))} placeholder="Leave empty for send-only" className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
+                              </div>
+                              {editingSmtp.imap_host.trim() !== '' && (
+                                <>
+                                  <div className="grid grid-cols-3 gap-2">
+                                    <div>
+                                      <label className="block text-xs font-medium text-gray-700">Port</label>
+                                      <input type="number" value={editingSmtp.imap_port} onChange={e => setEditingSmtp(prev => ({ ...prev, imap_port: +e.target.value }))} min={1} max={65535} className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
+                                    </div>
+                                    <div className="col-span-2">
+                                      <label className="block text-xs font-medium text-gray-700">Username</label>
+                                      <input type="text" value={editingSmtp.imap_username} onChange={e => setEditingSmtp(prev => ({ ...prev, imap_username: e.target.value }))} autoComplete="off" className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
+                                    </div>
+                                  </div>
+                                  <div>
+                                    <label className="block text-xs font-medium text-gray-700">IMAP password {editingSmtp._meta?.has_imap_password && <span className="text-gray-400 font-normal">(saved — re-enter to change)</span>}</label>
+                                    <input type="password" value={editingSmtp.imap_password} onChange={e => setEditingSmtp(prev => ({ ...prev, imap_password: e.target.value }))} autoComplete="new-password" placeholder={editingSmtp._meta?.has_imap_password ? '••••••••' : ''} className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
+                                  </div>
+                                </>
+                              )}
+                              {editingSmtp._meta?.last_tested_at && (
+                                <p className={`text-xs ${editingSmtp._meta.last_test_ok ? 'text-green-600' : 'text-red-600'}`}>
+                                  Last test: {editingSmtp._meta.last_test_ok ? 'passed' : `failed — ${editingSmtp._meta.last_test_error || 'unknown error'}`}
+                                </p>
+                              )}
+                              {editingSmtp._meta?.last_send_error && (
+                                <p className="text-xs text-red-600">
+                                  Last send error {editingSmtp._meta.last_send_at ? `(${new Date(editingSmtp._meta.last_send_at).toLocaleString()})` : ''}: {editingSmtp._meta.last_send_error}
+                                </p>
+                              )}
+                              <div className="border-t border-gray-200 pt-3">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <Button type="button" size="sm" variant="default" onClick={() => runSmtpDiagnose()} disabled={smtpDiagnosing}>
+                                    {smtpDiagnosing ? 'Diagnosing…' : 'Diagnose'}
+                                  </Button>
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    variant="outline"
+                                    onClick={() => { setSmtpShowSendTest((v) => !v); setSmtpSendTestMsg(null); }}
+                                    disabled={smtpSendTestBusy}
+                                  >
+                                    Send test email
+                                  </Button>
+                                </div>
+                                {smtpShowSendTest && (
+                                  <div className="mt-2 space-y-2">
+                                    <div className="flex gap-2">
+                                      <input
+                                        type="email"
+                                        value={smtpSendTestTo}
+                                        onChange={(e) => setSmtpSendTestTo(e.target.value)}
+                                        placeholder={editing.email || 'you@example.com'}
+                                        className="flex-1 min-w-0 border-gray-300 rounded-md text-sm"
+                                      />
+                                      <Button type="button" size="sm" variant="outline" onClick={sendSmtpTestEmail} disabled={smtpSendTestBusy}>
+                                        {smtpSendTestBusy ? 'Sending…' : 'Send'}
+                                      </Button>
+                                    </div>
+                                    {smtpSendTestMsg && (
+                                      <p className={`text-xs ${smtpSendTestMsg.type === 'error' ? 'text-red-600' : 'text-green-600'}`}>
+                                        {smtpSendTestMsg.text}
+                                      </p>
+                                    )}
+                                  </div>
+                                )}
+                                {smtpFormDirty && (
+                                  <p className="mt-1 text-[11px] text-amber-700">
+                                    Unsaved changes — Diagnose tests the saved settings. Click Save first to test these.
+                                  </p>
+                                )}
+                              </div>
+                              {smtpTestMsg && <div className={`text-sm ${smtpTestMsg.type === 'error' ? 'text-red-600' : 'text-green-600'}`}>{smtpTestMsg.text}</div>}
+                              {smtpDiagnose && (
+                                <SmtpDiagnosticReport
+                                  report={smtpDiagnose}
+                                  busy={smtpDiagnosing}
+                                  onTrySsl={() => applySuggestedMode('ssl')}
+                                  onTryStarttls={() => applySuggestedMode('starttls')}
+                                />
+                              )}
+                            </>
+                          )}
+                        </div>
+                      )}
+                      <div>
+                        <label className="block text-xs font-medium text-gray-700">Max emails per day</label>
+                        <input type="number" name="max_emails_per_day" value={editing.max_emails_per_day} onChange={e => { setEditing(prev => ({ ...prev, max_emails_per_day: +e.target.value })); setEditDirty(true); }} min={1} max={1000} className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-gray-700">Wait between emails (minutes)</label>
+                        <input type="number" name="wait_minutes_between" value={editing.wait_minutes_between || 5} onChange={e => { setEditing(prev => ({ ...prev, wait_minutes_between: +e.target.value })); setEditDirty(true); }} min={1} max={120} className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-gray-700">Send time jitter (minutes)</label>
+                        <input
+                          type="number"
+                          value={jitterInputMinutesFromSeconds(editing.max_jitter_seconds)}
+                          onChange={e => { setEditing(prev => ({ ...prev, max_jitter_seconds: jitterSecondsFromInputMinutes(e.target.value) })); setEditDirty(true); }}
+                          min={0}
+                          max={JITTER_MAX_MINUTES}
+                          step={0.5}
+                          className="mt-1 block w-full border-gray-300 rounded-md text-sm"
+                        />
+                        <p className="mt-1 text-xs text-gray-400">Random 0–N minute delay per send (stored as seconds on the server). Set to 0 to disable.</p>
+                      </div>
+                      <div className="border rounded p-3 space-y-4 bg-gray-50 min-w-0 max-w-full overflow-hidden">
+                        <p className="text-xs font-medium text-gray-500 uppercase tracking-wide">
+                          Tracking
+                          {mode === 'development' && devBeaconRegCount !== null && (
+                            <span className="normal-case font-normal text-gray-400">
+                              {' '}
+                              ({devBeaconRegCount} {devBeaconRegCount === 1 ? 'link' : 'links'})
+                            </span>
+                          )}
+                        </p>
+                        <InboxTrackingOptions
+                          key={editing.id}
+                          variant="edit"
+                          wrapClassName="space-y-4"
+                          radioName="inbox-tracking-edit"
+                          cnameUiEnabled={customTrackingCnameUiEnabled}
+                          cnameTarget={cnameTarget}
+                          uiMode={editTrackingMode}
+                          onUiModeChange={applyEditTrackingMode}
+                          trackingDomain={editing.tracking_domain || ''}
+                          onTrackingDomainChange={(val) => { setEditing(prev => ({ ...prev, tracking_domain: val })); setEditDirty(true); }}
+                          onDnsVerifyChange={setEditDomainVerified}
+                          beaconConnected={!!editing.beacon_connected}
+                          beaconBaseUrl={editing.beacon_base_url}
+                          beaconSetupUrl={beaconSetupUrl}
+                          onBeaconSetupUrlChange={(v) => { setBeaconSetupUrl(v); setEditDirty(true); }}
+                          onConnectBeacon={connectBeacon}
+                          onDisconnectBeacon={disconnectBeacon}
+                          beaconConnecting={beaconConnecting}
+                          siblingInboxesForReuse={inboxes}
+                          currentInboxId={editing.id}
+                          onBeaconConnectFromSibling={connectBeaconFromSibling}
+                          onReuseDnsDomain={reuseDnsFromSibling}
+                          dnsAutoVerifyTrigger={dnsAutoVerifyTrigger}
+                        />
+                      </div>
+                      <div className="border rounded p-3 space-y-3 bg-gray-50 min-w-0 max-w-full overflow-hidden">
+                        <p className="text-xs font-medium text-gray-500 uppercase tracking-wide">Warm-up</p>
+                        <div className="space-y-2">
+                          <label className="flex items-center gap-2 cursor-pointer text-xs font-medium text-gray-700">
+                            <input
+                              type="checkbox"
+                              checked={!!editing.ramp_up_enabled}
+                              onChange={e => { setEditing(prev => ({ ...prev, ramp_up_enabled: e.target.checked })); setEditDirty(true); }}
+                            />
+                            Enable inbox warm-up (ramp-up)
+                          </label>
+                          {editing.ramp_up_enabled && (
+                            <div className="space-y-2">
+                              <div>
+                                <label className="block text-xs font-medium text-gray-700">Starting emails per day</label>
+                                <input
+                                  type="number"
+                                  value={editing.ramp_up_start ?? 1}
+                                  onChange={e => { setEditing(prev => ({ ...prev, ramp_up_start: Math.max(1, +e.target.value) })); setEditDirty(true); }}
+                                  min={1}
+                                  max={editing.max_emails_per_day}
+                                  className="mt-1 block w-full border-gray-300 rounded-md text-sm"
+                                />
+                              </div>
+                              <div>
+                                <label className="block text-xs font-medium text-gray-700">Step size (emails added per day)</label>
+                                <input
+                                  type="number"
+                                  value={editing.ramp_up_step_size ?? 1}
+                                  onChange={e => { setEditing(prev => ({ ...prev, ramp_up_step_size: Math.max(1, +e.target.value) })); setEditDirty(true); }}
+                                  min={1}
+                                  max={100}
+                                  className="mt-1 block w-full border-gray-300 rounded-md text-sm"
+                                />
+                              </div>
+                              <p className="text-xs text-gray-500">
+                                Starts at {editing.ramp_up_start ?? 1} email{(editing.ramp_up_start ?? 1) !== 1 ? 's' : ''} on day one, adds {editing.ramp_up_step_size ?? 1} more each day, and turns off automatically once it reaches {editing.max_emails_per_day}.
+                                Today's limit: <strong>{editing.effective_max_per_day ?? editing.ramp_up_start ?? 1}</strong> / {editing.max_emails_per_day}
+                              </p>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                      <div className="flex gap-2 pt-1">
+                        <Button type="submit" size="sm" variant="default">Save</Button>
+                        <Button type="button" size="sm" variant="outline" onClick={tryCloseEdit}>Cancel</Button>
+                      </div>
+                    </form>
+                  </div>
+                </>
+              ) : (
+                <>
+                  {/* Panel header */}
+                  <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="w-9 h-9 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-white text-sm font-semibold shrink-0">
+                        {(selectedInbox.email || selectedInbox.display_name || 'I')[0].toUpperCase()}
+                      </div>
+                      <div className="min-w-0">
+                        <p className="font-semibold text-gray-900 text-sm leading-tight truncate">{selectedInbox.email || '(Connected account)'}</p>
+                        {selectedInbox.display_name && (
+                          <p className="text-xs text-gray-500 truncate leading-tight mt-0.5">{selectedInbox.display_name}</p>
+                        )}
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => setSelectedInbox(null)}
+                      className="shrink-0 w-7 h-7 flex items-center justify-center rounded-lg text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors"
+                      aria-label="Close panel"
+                    >
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                      </svg>
+                    </button>
+                  </div>
+
+                  {/* Scrollable content */}
+                  <div className="px-5 py-4 space-y-4 overflow-y-auto flex-1">
+                    {/* Token expired banner */}
+                    {expiredInboxIds.has(selectedInbox.id) && (
+                      <div className="p-3 bg-red-50 border border-red-200 rounded-lg flex items-start gap-2">
+                        <svg className="w-4 h-4 text-red-500 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                        <div className="min-w-0">
+                          <p className="text-sm font-medium text-red-800">Token expired</p>
+                          <p className="text-xs text-red-600 mt-0.5">Reconnect this account at the bottom of this panel.</p>
+                        </div>
+                      </div>
+                    )}
+                    {/* Status + Provider row */}
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-1.5">
+                        {selectedInbox.paused
+                          ? <span className="text-xs bg-orange-100 text-orange-700 px-2.5 py-1 rounded-full font-medium">Paused</span>
+                          : selectedInbox.health === 'failing'
+                            ? <span className="text-xs bg-red-100 text-red-700 px-2.5 py-1 rounded-full font-medium">Failing</span>
+                            : selectedInbox.health === 'ok'
+                              ? <span className="text-xs bg-green-100 text-green-700 px-2.5 py-1 rounded-full font-medium">Healthy</span>
+                              : selectedInbox.provider === 'smtp'
+                                ? <span className="text-xs bg-gray-100 text-gray-600 px-2.5 py-1 rounded-full font-medium">Unknown</span>
+                                : <span className="text-xs bg-green-100 text-green-700 px-2.5 py-1 rounded-full font-medium">Active</span>
+                        }
+                      </div>
+                      <span className="text-xs bg-sky-100 text-sky-700 px-2.5 py-1 rounded-full font-medium capitalize">{selectedInbox.provider || 'gmail'}</span>
+                    </div>
+
+                    {/* SMTP send health — the reason behind the badge above */}
+                    {selectedInbox.provider === 'smtp' && (selectedInbox.last_send_error || selectedInbox.health === 'failing' || selectedInbox.health === 'unknown') && (
+                      <div className={`p-3 rounded-lg border flex items-start gap-2 ${
+                        selectedInbox.last_send_error
+                          ? 'bg-red-50 border-red-200'
+                          : 'bg-amber-50 border-amber-200'
+                      }`}>
+                        <svg className={`w-4 h-4 mt-0.5 shrink-0 ${selectedInbox.last_send_error ? 'text-red-500' : 'text-amber-500'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                        <div className="min-w-0">
+                          <p className={`text-sm font-medium ${selectedInbox.last_send_error ? 'text-red-800' : 'text-amber-800'}`}>
+                            {selectedInbox.last_send_error ? 'Sending is failing' : 'Not verified yet'}
+                          </p>
+                          <p className={`text-xs mt-0.5 break-words ${selectedInbox.last_send_error ? 'text-red-600' : 'text-amber-700'}`}>
+                            {selectedInbox.last_send_error
+                              ? `${selectedInbox.last_send_at ? `Last attempt ${new Date(selectedInbox.last_send_at).toLocaleString()}: ` : ''}${selectedInbox.last_send_error}`
+                              : 'Run Diagnose inbox from the edit panel to verify this relay.'}
+                          </p>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Sent today */}
+                    <div>
+                      <div className="flex justify-between items-center mb-1.5">
+                        <span className="text-xs font-medium text-gray-500 uppercase tracking-wide">Today</span>
+                        <span className="text-sm font-semibold text-gray-900">
+                          {selectedInbox.sent_today || 0}
+                          <span className="text-gray-400 font-normal"> / {selectedInbox.effective_max_per_day || selectedInbox.max_emails_per_day}</span>
+                        </span>
+                      </div>
+                      <div className="w-full bg-gray-100 rounded-full h-1.5">
+                        <div
+                          className="bg-blue-500 h-1.5 rounded-full transition-all"
+                          style={{ width: `${Math.min(100, ((selectedInbox.sent_today || 0) / (selectedInbox.effective_max_per_day || selectedInbox.max_emails_per_day || 1)) * 100)}%` }}
+                        />
+                      </div>
+                    </div>
+
+                    <hr className="border-gray-100" />
+
+                    {/* Settings */}
+                    <div className="space-y-2.5">
+                      <p className="text-xs font-medium text-gray-500 uppercase tracking-wide">Settings</p>
+                      <div className="flex justify-between text-sm">
+                        <span className="text-gray-600">Max per day</span>
+                        <span className="font-medium text-gray-900">{selectedInbox.max_emails_per_day}</span>
+                      </div>
+                      <div className="flex justify-between text-sm">
+                        <span className="text-gray-600">Wait between sends</span>
+                        <span className="font-medium text-gray-900">{selectedInbox.wait_minutes_between || 5} min</span>
+                      </div>
+                      <div className="flex justify-between text-sm">
+                        <span className="text-gray-600">Send jitter</span>
+                        <span className="font-medium text-gray-900">
+                          {formatJitterMinutesLabel(selectedInbox.max_jitter_seconds)
+                            ?? <span className="text-gray-400">disabled</span>}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Warm-up */}
+                    {selectedInbox.ramp_up_enabled && (
+                      <>
+                        <hr className="border-gray-100" />
+                        <div className="space-y-2.5">
+                          <p className="text-xs font-medium text-gray-500 uppercase tracking-wide">Warm-up</p>
+                          {selectedInbox.effective_max_per_day < selectedInbox.max_emails_per_day ? (
+                            <>
+                              <div className="flex justify-between text-sm">
+                                <span className="text-gray-600">Today's stage</span>
+                                <span className="font-medium text-amber-700">{selectedInbox.effective_max_per_day} / {selectedInbox.max_emails_per_day}</span>
+                              </div>
+                              <div className="w-full bg-amber-100 rounded-full h-1.5">
+                                <div
+                                  className="bg-amber-500 h-1.5 rounded-full"
+                                  style={{ width: `${Math.min(100, (selectedInbox.effective_max_per_day / (selectedInbox.max_emails_per_day || 1)) * 100)}%` }}
+                                />
+                              </div>
+                            </>
+                          ) : (
+                            <p className="text-sm text-green-700 font-medium">Complete ✓</p>
+                          )}
+                          <div className="flex justify-between text-sm">
+                            <span className="text-gray-600">Ramp period</span>
+                            <span className="font-medium text-gray-900">{Math.ceil((selectedInbox.max_emails_per_day - (selectedInbox.ramp_up_start || 1)) / (selectedInbox.ramp_up_step_size || 1))} days</span>
+                          </div>
+                        </div>
+                      </>
+                    )}
+
+                    <hr className="border-gray-100" />
+
+                    {/* Tracking domain / Beacon */}
+                    <div className="flex justify-between items-center text-sm">
+                      <span className="text-gray-600">Tracking</span>
+                      <span className="font-mono text-xs text-right max-w-[180px] truncate">
+                        {selectedInbox.beacon_connected && selectedInbox.beacon_base_url
+                          ? <span className="text-indigo-700" title={selectedInbox.beacon_base_url}>Beacon</span>
+                          : selectedInbox.tracking_domain
+                            ? <span className="text-teal-700">{selectedInbox.tracking_domain}</span>
+                            : <span className="text-gray-400">app default</span>}
+                      </span>
+                    </div>
+                    {selectedInbox.beacon_connected && selectedInbox.beacon_base_url && (
+                      <p className="text-xs text-gray-500 break-all">{selectedInbox.beacon_base_url}</p>
+                    )}
+
+                    {/* Created */}
+                    <div className="flex justify-between items-center text-sm">
+                      <span className="text-gray-600">Added</span>
+                      <span className="text-gray-900">{new Date(selectedInbox.created_at).toLocaleDateString()}</span>
+                    </div>
+                  </div>
+
+                  {/* Action buttons */}
+                  <div className="px-5 py-4 border-t border-gray-100 space-y-2">
+                    <div className="flex gap-2">
+                      <Button variant="outline" size="sm" className="flex-1" onClick={() => openEdit(selectedInbox)}>Edit</Button>
+                      {selectedInbox.paused
+                        ? <Button variant="outline" size="sm" className="flex-1 bg-green-50 text-green-700 border-green-300 hover:bg-green-100" onClick={() => resumeInbox(selectedInbox.id, selectedInbox.email)}>Resume</Button>
+                        : <Button variant="outline" size="sm" className="flex-1 bg-orange-50 text-orange-700 border-orange-300 hover:bg-orange-100" onClick={() => openPauseModal(selectedInbox)}>Pause</Button>
+                      }
+                    </div>
+                    {(selectedInbox.provider === 'gmail' || selectedInbox.provider === 'office365') && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="w-full"
+                        onClick={() => reconnectInbox(selectedInbox)}
+                        title="Re-authenticate this inbox to refresh the OAuth login"
+                      >
+                        Reconnect login
+                      </Button>
+                    )}
+                    {(selectedInbox.provider === 'gmail' || selectedInbox.provider === 'office365') && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="w-full"
+                        onClick={() => generateConnectUrlForInbox(selectedInbox)}
+                        title="Generate a one-time link to connect from another browser"
+                      >
+                        Copy Connect URL
+                      </Button>
+                    )}
+                    <Button variant="danger" size="sm" className="w-full" onClick={() => deleteInbox(selectedInbox.id, selectedInbox.email)}>Delete inbox</Button>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* add modal */}
+      {showAdd && (
+        <div
+          className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
+          onMouseDown={e => { addBackdropDown.current = e.target === e.currentTarget; }}
+          onClick={() => { if (addBackdropDown.current) { setShowAdd(false); setMessage(null); setAddTrackingMode('app'); setAddSmtpDiagnose(null); setAddSmtpSendTestMsg(null); setAddSmtpShowSendTest(false); } }}
+        >
+          <div data-darkreader-ignore className="p-6 rounded-xl shadow-lg w-full min-w-0 max-w-md max-h-[90vh] overflow-y-auto overflow-x-hidden mx-auto" style={{ backgroundColor: 'white' }} onClick={e => e.stopPropagation()}>
+            <h2 className="text-xl font-semibold mb-2">Add Inbox</h2>
+            {message && <div className={message.type === 'error' ? 'text-red-600' : 'text-green-600'}>{message.text}</div>}
+            <form onSubmit={submit} className="space-y-4 min-w-0 max-w-full">
+              <div>
+                <label className="block text-sm font-medium text-gray-700">Provider</label>
+                <select name="provider" value={form.provider} onChange={handleProviderChange} className="mt-1 block w-full border-gray-300 rounded-md">
+                  <option value="gmail">Gmail / Google Workspace</option>
+                  <option value="office365">Office 365 / Outlook</option>
+                  <option value="smtp">SMTP (any provider)</option>
+                </select>
+              </div>
+
+              {form.provider === 'smtp' && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700">Email address</label>
+                  <input type="email" name="email" value={form.email} onChange={handleChange} placeholder="you@yourdomain.com" className="mt-1 block w-full border-gray-300 rounded-md" />
+                  <p className="mt-1 text-xs text-gray-400">The From address used for sending. It should match your SMTP account.</p>
+                </div>
+              )}
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700">Display name</label>
+                <input type="text" name="display_name" value={form.display_name} onChange={handleChange} className="mt-1 block w-full border-gray-300 rounded-md" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700">Max emails per day</label>
+                <input type="number" name="max_emails_per_day" value={form.max_emails_per_day} onChange={handleChange} min={1} max={1000} className="mt-1 block w-full border-gray-300 rounded-md" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700">Wait between emails (minutes)</label>
+                <input type="number" name="wait_minutes_between" value={form.wait_minutes_between} onChange={handleChange} min={1} max={120} className="mt-1 block w-full border-gray-300 rounded-md" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700">Send time jitter (minutes)</label>
+                <input
+                  type="number"
+                  value={jitterInputMinutesFromSeconds(form.max_jitter_seconds)}
+                  onChange={e => setForm(f => ({ ...f, max_jitter_seconds: jitterSecondsFromInputMinutes(e.target.value) }))}
+                  min={0}
+                  max={JITTER_MAX_MINUTES}
+                  step={0.5}
+                  className="mt-1 block w-full border-gray-300 rounded-md"
+                />
+                <p className="mt-1 text-xs text-gray-400">Random 0–N minute delay per send (default 3 min). Set to 0 to disable.</p>
+              </div>
+              {form.provider === 'smtp' && (
+                <div className="border rounded p-3 space-y-3 bg-gray-50 min-w-0 max-w-full overflow-hidden">
+                  <p className="text-xs font-medium text-gray-500 uppercase tracking-wide">SMTP (outbound)</p>
+                  <div className="grid grid-cols-3 gap-2">
+                    <div className="col-span-2">
+                      <label className="block text-xs font-medium text-gray-700">Host</label>
+                      <input type="text" value={smtpForm.smtp_host} onChange={e => { if (message?.type === 'error') setMessage(null); setSmtpForm(f => ({ ...f, smtp_host: e.target.value })); }} placeholder="mail.yourdomain.com" className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-gray-700">Port</label>
+                      <input type="number" value={smtpForm.smtp_port} onChange={e => setSmtpForm(f => ({ ...f, smtp_port: +e.target.value }))} min={1} max={65535} className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-700">Username</label>
+                    <input type="text" value={smtpForm.smtp_username} onChange={e => { if (message?.type === 'error') setMessage(null); setSmtpForm(f => ({ ...f, smtp_username: e.target.value })); }} autoComplete="off" className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-700">Password</label>
+                    <input type="password" value={smtpForm.smtp_password} onChange={e => { if (message?.type === 'error') setMessage(null); setSmtpForm(f => ({ ...f, smtp_password: e.target.value })); }} autoComplete="new-password" className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
+                  </div>
+                  <div className="flex gap-4 text-sm text-gray-700">
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input type="checkbox" checked={!!smtpForm.smtp_use_tls} onChange={e => setSmtpForm(f => ({ ...f, smtp_use_tls: e.target.checked, smtp_use_ssl: e.target.checked ? false : f.smtp_use_ssl }))} />
+                      STARTTLS (587)
+                    </label>
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input type="checkbox" checked={!!smtpForm.smtp_use_ssl} onChange={e => setSmtpForm(f => ({ ...f, smtp_use_ssl: e.target.checked, smtp_use_tls: e.target.checked ? false : f.smtp_use_tls }))} />
+                      SSL (465)
+                    </label>
+                  </div>
+                  <p className="text-xs font-medium text-gray-500 uppercase tracking-wide pt-1">IMAP (inbound replies — optional)</p>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-700">Host</label>
+                    <input type="text" value={smtpForm.imap_host} onChange={e => { if (message?.type === 'error') setMessage(null); setSmtpForm(f => ({ ...f, imap_host: e.target.value })); }} placeholder="Leave empty for send-only" className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
+                  </div>
+                  {smtpForm.imap_host.trim() !== '' && (
+                    <>
+                      <div className="grid grid-cols-3 gap-2">
+                        <div>
+                          <label className="block text-xs font-medium text-gray-700">Port</label>
+                          <input type="number" value={smtpForm.imap_port} onChange={e => setSmtpForm(f => ({ ...f, imap_port: +e.target.value }))} min={1} max={65535} className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
+                        </div>
+                        <div className="col-span-2">
+                          <label className="block text-xs font-medium text-gray-700">Username</label>
+                          <input type="text" value={smtpForm.imap_username} onChange={e => setSmtpForm(f => ({ ...f, imap_username: e.target.value }))} autoComplete="off" className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
+                        </div>
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-gray-700">Password</label>
+                        <input type="password" value={smtpForm.imap_password} onChange={e => { if (message?.type === 'error') setMessage(null); setSmtpForm(f => ({ ...f, imap_password: e.target.value })); }} autoComplete="new-password" className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
+                      </div>
+                      <label className="flex items-center gap-1.5 cursor-pointer text-sm text-gray-700">
+                        <input type="checkbox" checked={!!smtpForm.imap_use_ssl} onChange={e => setSmtpForm(f => ({ ...f, imap_use_ssl: e.target.checked }))} />
+                        Use SSL (993)
+                      </label>
+                    </>
+                  )}
+                  <p className="text-xs text-gray-400">Connection is tested automatically after the inbox is created.</p>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button type="button" size="sm" variant="default" onClick={runAddSmtpDiagnose} disabled={addSmtpDiagnosing}>
+                      {addSmtpDiagnosing ? 'Diagnosing…' : 'Diagnose'}
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => { setAddSmtpShowSendTest((v) => !v); setAddSmtpSendTestMsg(null); }}
+                      disabled={addSmtpSendTestBusy}
+                    >
+                      Send test email
+                    </Button>
+                  </div>
+                  {message?.type === 'error' && addSmtpMissingFields().length > 0 && (
+                    <p className="text-xs text-red-600 bg-red-50 border border-red-200 rounded px-2 py-1.5">
+                      Fill in {addSmtpMissingFields().join(', ')} first, then Diagnose.
+                    </p>
+                  )}
+                  {addSmtpDiagnose && (
+                    <SmtpDiagnosticReport
+                      report={addSmtpDiagnose}
+                      busy={addSmtpDiagnosing}
+                      onTrySsl={() => applySuggestedModeAdd('ssl')}
+                      onTryStarttls={() => applySuggestedModeAdd('starttls')}
+                    />
+                  )}
+                  {addSmtpShowSendTest && (
+                    <div className="pt-1 space-y-2">
+                      <p className="text-[11px] text-gray-400">
+                        Creates the inbox, then delivers a real test message.
+                      </p>
+                      <div className="flex gap-2">
+                        <input
+                          type="email"
+                          value={addSmtpSendTestTo}
+                          onChange={(e) => setAddSmtpSendTestTo(e.target.value)}
+                          placeholder={form.email || 'you@example.com'}
+                          className="flex-1 min-w-0 border-gray-300 rounded-md text-sm"
+                        />
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={addSmtpSendTestBusy}
+                          onClick={() => {
+                            const to = (addSmtpSendTestTo || form.email || '').trim();
+                            if (!to || !to.includes('@')) {
+                              setAddSmtpSendTestMsg({ type: 'error', text: 'Enter a recipient email address.' });
+                              return;
+                            }
+                            const missing = addSmtpMissingFields();
+                            if (missing.length > 0) {
+                              setAddSmtpSendTestMsg({ type: 'error', text: `Fill in ${missing.join(', ')} first.` });
+                              return;
+                            }
+                            setAddSmtpSendTestTo(to);
+                            setAddSmtpSendTestBusy(true);
+                          setAddSmtpSendTestMsg(null);
+                          submitSmtp({ ...form, tracking_domain: addTrackingMode === 'dns' ? form.tracking_domain.trim() || null : null }, to)
+                            .catch((e) => setAddSmtpSendTestMsg({ type: 'error', text: e.message }))
+                            .finally(() => setAddSmtpSendTestBusy(false));
+                        }}
+                      >
+                        {addSmtpSendTestBusy ? 'Sending…' : 'Send'}
+                      </Button>
+                    </div>
+                    {addSmtpSendTestMsg && (
+                      <p className={`text-xs ${addSmtpSendTestMsg.type === 'error' ? 'text-red-600' : 'text-green-600'}`}>
+                        {addSmtpSendTestMsg.text}
+                      </p>
+                    )}
+                    </div>
+                  )}
+                </div>
+              )}
+              <div className="border rounded p-3 space-y-4 bg-gray-50 min-w-0 max-w-full overflow-hidden">
+                <p className="text-xs font-medium text-gray-500 uppercase tracking-wide">Tracking</p>
+                <InboxTrackingOptions
+                  variant="add"
+                  wrapClassName="space-y-4"
+                  radioName="inbox-tracking-add"
+                  cnameUiEnabled={customTrackingCnameUiEnabled}
+                  cnameTarget={cnameTarget}
+                  uiMode={addTrackingMode}
+                  onUiModeChange={applyAddTrackingMode}
+                  trackingDomain={form.tracking_domain}
+                  onTrackingDomainChange={(val) => { setForm(f => ({ ...f, tracking_domain: val })); setAddDomainVerified(false); }}
+                  onDnsVerifyChange={setAddDomainVerified}
+                  beaconConnected={false}
+                  beaconBaseUrl=""
+                  beaconSetupUrl=""
+                  onBeaconSetupUrlChange={() => {}}
+                  onConnectBeacon={() => {}}
+                  onDisconnectBeacon={() => {}}
+                  beaconConnecting={false}
+                />
+              </div>
+              <div className="border rounded p-3 space-y-3 bg-gray-50 min-w-0 max-w-full overflow-hidden">
+                <p className="text-xs font-medium text-gray-500 uppercase tracking-wide">Warm-up</p>
+                <div className="space-y-2">
+                  <label className="flex items-center gap-2 cursor-pointer text-sm font-medium text-gray-700">
+                    <input
+                      type="checkbox"
+                      checked={!!form.ramp_up_enabled}
+                      onChange={e => setForm(f => ({ ...f, ramp_up_enabled: e.target.checked }))}
+                    />
+                    Enable inbox warm-up (ramp-up)
+                  </label>
+                  {form.ramp_up_enabled && (
+                    <div className="space-y-2">
+                      <div>
+                        <label className="block text-xs font-medium text-gray-700">Starting emails per day</label>
+                        <input
+                          type="number"
+                          value={form.ramp_up_start}
+                          onChange={e => setForm(f => ({ ...f, ramp_up_start: Math.max(1, +e.target.value) }))}
+                          min={1}
+                          max={form.max_emails_per_day}
+                          className="mt-1 block w-full border-gray-300 rounded-md text-sm"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-gray-700">Step size (emails added per day)</label>
+                        <input
+                          type="number"
+                          value={form.ramp_up_step_size}
+                          onChange={e => setForm(f => ({ ...f, ramp_up_step_size: Math.max(1, +e.target.value) }))}
+                          min={1}
+                          max={100}
+                          className="mt-1 block w-full border-gray-300 rounded-md text-sm"
+                        />
+                      </div>
+                      <p className="text-xs text-gray-500">
+                        Starts at {form.ramp_up_start} email{form.ramp_up_start !== 1 ? 's' : ''} on day one, adds {form.ramp_up_step_size} more each day, and turns off automatically once it reaches {form.max_emails_per_day}.
+                      </p>
+                    </div>
+                  )}
+                </div>
+              </div>
+              {form.provider === 'gmail' && (
+                <>
+                  {!oauthConfigured && (
+                    <div className="text-red-600">
+                      Google OAuth credentials are not configured. Set the appropriate environment variables (e.g. in `.env`) and restart the server before reloading.
+                    </div>
+                  )}
+                  <RedirectUriBlock uri={redirectUri} size="sm" />
+                </>
+              )}
+              {form.provider === 'office365' && (
+                <>
+                  {!o365Configured && (
+                    <div className="text-red-600">
+                      Office 365 OAuth credentials are not configured. Set OFFICE365_CLIENT_ID, OFFICE365_CLIENT_SECRET, and OFFICE365_TENANT_ID in your environment and restart the server.
+                    </div>
+                  )}
+                  <RedirectUriBlock uri={o365RedirectUri} size="sm" />
+                </>
+              )}
+              <div className="flex gap-2">
+                <Button type="submit" disabled={!canSubmit()} variant="default">
+                  {form.provider === 'gmail' ? 'Connect with Google' : form.provider === 'office365' ? 'Connect with Microsoft' : 'Add inbox'}
+                </Button>
+                <Button type="button" variant="outline" onClick={() => { setShowAdd(false); setMessage(null); setAddTrackingMode('app'); setAddSmtpDiagnose(null); setAddSmtpSendTestMsg(null); setAddSmtpShowSendTest(false); }}>
+                  Cancel
+                </Button>
+              </div>
+              {(form.provider === 'gmail' || form.provider === 'office365') && (
+                <div className="mt-3 pt-3 border-t border-gray-200">
+                  <div className="flex items-center gap-2 mb-2">
+                    <div className="h-px flex-1 bg-gray-200" />
+                    <span className="text-xs text-gray-400 font-medium uppercase tracking-wider">or</span>
+                    <div className="h-px flex-1 bg-gray-200" />
+                  </div>
+                  <p className="text-xs text-gray-500 mb-2 text-center">
+                    Click to copy a one-time link. Open it in a browser where your account is signed in.
+                  </p>
+                  <Button type="button" variant="outline" size="sm" className="w-full" onClick={generateConnectUrlForForm}>
+                    <svg className="w-3.5 h-3.5 mr-1.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
+                    </svg>
+                    Copy Connect Link
+                  </Button>
+                </div>
+              )}
+            </form>
+          </div>
+        </div>
+      )}
+
+
+
+      {/* Unsaved changes warning for inbox edit */}
+      {showEditWarning && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-[60] p-4">
+          <div data-darkreader-ignore className="rounded-xl shadow-lg p-6 w-full max-w-sm mx-auto" style={{ backgroundColor: 'white' }}>
+            <h3 className="font-semibold text-gray-800 mb-1">Save changes?</h3>
+            <p className="text-sm text-gray-500 mb-4">You have unsaved changes to this inbox.</p>
+            <div className="flex gap-2 justify-end">
+              <Button size="sm" variant="outline" onClick={() => { setShowEditWarning(false); setEditWarningCloseSidebar(false); }}>Keep editing</Button>
+              <Button size="sm" variant="destructive" onClick={() => { setShowEditWarning(false); closeEdit(); if (editWarningCloseSidebar) { setSelectedInbox(null); setEditWarningCloseSidebar(false); } }}>Discard</Button>
+              <Button size="sm" variant="default" onClick={async () => { setShowEditWarning(false); setEditWarningCloseSidebar(false); await doSave(); }}>Save</Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Pause inbox modal */}
+      {showPauseModal && pausingInbox && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div data-darkreader-ignore className="bg-white p-6 rounded-xl shadow-lg w-full max-w-md mx-auto">
+            <h2 className="text-xl font-semibold mb-1">Pause Inbox</h2>
+            <p className="text-sm text-gray-500 mb-4">
+              Pausing <span className="font-mono font-medium">{pausingInbox.email}</span>. What should happen to leads currently assigned to this inbox?
+            </p>
+
+            <div className="space-y-3 mb-5">
+              <label className="flex items-start gap-3 cursor-pointer p-3 border rounded-lg hover:bg-gray-50 transition-colors">
+                <input
+                  type="radio"
+                  className="mt-0.5 shrink-0"
+                  checked={pauseAction === 'reassign'}
+                  onChange={() => setPauseAction('reassign')}
+                />
+                <div>
+                  <p className="text-sm font-medium text-gray-800">Reassign to another inbox</p>
+                  <p className="text-xs text-gray-500 mt-0.5">
+                    The queue will be recalculated and leads will be automatically redistributed across remaining active inboxes.
+                  </p>
+                </div>
+              </label>
+
+              <label className="flex items-start gap-3 cursor-pointer p-3 border rounded-lg hover:bg-gray-50 transition-colors">
+                <input
+                  type="radio"
+                  className="mt-0.5 shrink-0"
+                  checked={pauseAction === 'pause_leads'}
+                  onChange={() => setPauseAction('pause_leads')}
+                />
+                <div>
+                  <p className="text-sm font-medium text-gray-800">Pause all assigned leads</p>
+                  <p className="text-xs text-gray-500 mt-0.5">Sending will be paused for every lead whose next email is scheduled through this inbox. You can resume them individually later.</p>
+                </div>
+              </label>
+            </div>
+
+            <div className="flex gap-2 justify-end">
+              <Button size="sm" variant="outline" onClick={() => setShowPauseModal(false)}>Cancel</Button>
+              <Button
+                size="sm"
+                variant="default"
+                onClick={confirmPause}
+              >
+                Pause Inbox
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

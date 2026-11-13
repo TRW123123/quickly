@@ -1,0 +1,29 @@
+# Caddyfile.dev — development variant (docker-compose.dev.yml).
+#
+# On-demand TLS for arbitrary tracking domains is intentionally NOT enabled here.
+# On a machine that also runs host Caddy + production Quickly, only production
+# (127.0.0.1:5050 / Caddyfile.host) should run on_demand_tls — otherwise dev and
+# prod both compete for the same public :443 and duplicate ask logic.
+#
+# Custom tracking over HTTPS: use production, or docker-compose-not-host.dev.yml
+# (backend on :5051) behind host Caddy with ask → 127.0.0.1:5050 only.
+#
+# Local workflow
+# --------------
+# 1. docker compose -f docker-compose.dev.yml up
+# 2. HTTP on :80 (set CADDY_HOST in .env for a hostname), or https://localhost (internal cert).
+
+{$CADDY_HOST::80} {
+    reverse_proxy backend:8000 {
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+}
+
+localhost {
+    tls internal
+    reverse_proxy backend:8000 {
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+}

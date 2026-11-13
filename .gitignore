@@ -1,0 +1,41 @@
+# Environment and secrets
+.env
+.env_dev
+
+# Database
+*.db
+*.db-journal
+
+# Node
+node_modules/
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+.venv/
+venv/
+*.pyc
+.idea/
+temp/
+
+# Local DB dumps from Settings → Backup (Docker Compose dev)
+
+backups/
+
+# Caddy TLS certificates (persisted locally to avoid Let's Encrypt rate limits)
+caddy_data/
+caddy_config/
+caddy_data_dev/
+caddy_config_dev/
+Caddyfile.host
+
+# quickly-beacon
+quickly-beacon/
+n8n-node/dist/
+
+AGENTS.md
+tasks.md
+.omo/
+.commandcode/

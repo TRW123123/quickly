@@ -1,0 +1,78 @@
+name: quickly-dev
+
+services:
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    ports:
+      - "5433:5432"          # keep same port as local setup
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: quickly
+    volumes:
+      - pgdata_dev:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app
+    volumes:
+      - ./:/app          # mount source for live reload
+      - ./backups:/app/backups
+    ports:
+      - "8000:8000"      # direct access without Caddy (useful for quick testing)
+    env_file: .env
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://postgres:postgres@db:5432/quickly"
+      # Server-side backup folder in Settings (default path backups/ under /app)
+      QUICKLY_LOCAL_DISK_BACKUPS: "1"
+      # Source dev: show CNAME custom tracking UI (image defaults to prebuilt=1).
+      QUICKLY_PREBUILT_IMAGE: "0"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  caddy:
+    image: caddy:alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"    # HTTP/3
+    volumes:
+      - ./Caddyfile.dev:/etc/caddy/Caddyfile:ro
+      - ./caddy_data_dev:/data
+      - ./caddy_config_dev:/config
+    env_file: .env
+    depends_on:
+      - backend
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    # bind vite to 0.0.0.0 so host port-mapping works (otherwise it listens
+    # only on localhost inside the container and "Network: use --host to
+    # expose" will appear in the logs)
+    command: npm run dev -- --host
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "5173:5173"
+    env_file: .env
+    environment:
+      VITE_API_URL: "http://backend:8000"
+    depends_on:
+      backend:
+        condition: service_started
+
+volumes:
+  pgdata_dev:

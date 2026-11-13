@@ -1,0 +1,756 @@
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Link, useSearchParams } from 'react-router-dom';
+import { api } from '../api';
+import { Button } from '../components/ui/Button';
+import { FileUploadArea } from '../components/ui/FileUploadArea';
+import { Card } from '../components/ui/Card';
+import { Input } from '../components/ui/Input';
+import { useNotify } from '../context/NotificationContext';
+import { useConfirm } from '../context/ConfirmContext';
+import { useLoading } from '../context/LoadingContext';
+import { cn } from '../utils/cn';
+
+const STATUS_OPTIONS = [
+  { value: 'all', label: 'All statuses' },
+  { value: 'active', label: 'Enrollment: active' },
+  { value: 'contacted', label: 'Enrollment: contacted' },
+  { value: 'completed', label: 'Enrollment: completed' },
+  { value: 'bounced', label: 'Enrollment: bounced' },
+  { value: 'unsubscribed', label: 'Enrollment: unsubscribed' },
+  { value: 'wrong_person', label: 'Enrollment: wrong_person' },
+  { value: 'invalid', label: 'Verify: invalid' },
+  { value: 'replied', label: 'Has reply' },
+];
+
+const INTEREST_FILTER_OPTIONS = [
+  { value: 'all', label: 'All interest' },
+  { value: 'unset', label: 'No interest set' },
+  { value: 'interested', label: 'Interested' },
+  { value: 'not_interested', label: 'Not interested' },
+  { value: 'out_of_office', label: 'Out of office' },
+  { value: 'auto_reply', label: 'Auto-reply' },
+];
+
+const TAB_ALL = 'all';
+const TAB_BOUNCED = 'bounced';
+
+function formatEnrolled(campaigns) {
+  if (!campaigns?.length) return '—';
+  const dates = campaigns.map((c) => new Date(c.enrolled_at).getTime()).filter(Number.isFinite);
+  if (!dates.length) return '—';
+  const earliest = new Date(Math.min(...dates));
+  return earliest.toLocaleDateString();
+}
+
+function statusPillClass(status) {
+  switch (status) {
+    case 'active':
+    case 'contacted':
+      return 'bg-green-100 text-green-800';
+    case 'completed':
+      return 'bg-blue-100 text-blue-800';
+    case 'unsubscribed':
+    case 'wrong_person':
+      return 'bg-gray-200 text-gray-700';
+    case 'bounced':
+    case 'invalid':
+      return 'bg-red-100 text-red-800';
+    default:
+      return 'bg-gray-100 text-gray-700';
+  }
+}
+
+function leadRowSummary(lead) {
+  const camps = lead.campaigns || [];
+  if (!camps.length) return '—';
+  const bits = camps.map((c) => `${c.campaign_name?.slice(0, 12) || c.campaign_id}:${c.status || 'active'}`);
+  return bits.slice(0, 3).join(' · ') + (bits.length > 3 ? '…' : '');
+}
+
+function buildLeadsQueryParams({ tab, debouncedSearch, statusFilter, interestFilter }) {
+  const params = new URLSearchParams();
+  if (debouncedSearch) params.set('q', debouncedSearch);
+  if (tab === TAB_BOUNCED) {
+    params.set('bad_only', 'true');
+  }
+  if (tab === TAB_ALL && statusFilter !== 'all') {
+    params.set('status', statusFilter);
+  }
+  if (interestFilter && interestFilter !== 'all') {
+    params.set('interest', interestFilter);
+  }
+  return params;
+}
+
+export default function Leads() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tab = searchParams.get('tab') === TAB_BOUNCED ? TAB_BOUNCED : TAB_ALL;
+
+  const setTab = (next) => {
+    const p = new URLSearchParams(searchParams);
+    if (next === TAB_ALL) p.delete('tab');
+    else p.set('tab', next);
+    setSearchParams(p);
+  };
+
+  const [leads, setLeads] = useState([]);
+  const [search, setSearch] = useState('');
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [interestFilter, setInterestFilter] = useState('all');
+  const [leadsPage, setLeadsPage] = useState(1);
+  const [leadsTotal, setLeadsTotal] = useState(0);
+  const [leadsHasMore, setLeadsHasMore] = useState(false);
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [allSelected, setAllSelected] = useState(false);
+  const [excludedIds, setExcludedIds] = useState(() => new Set());
+  const [emailDrafts, setEmailDrafts] = useState({});
+  const [bulkEnrollmentStatus, setBulkEnrollmentStatus] = useState('active');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+
+  const notify = useNotify();
+  const confirm = useConfirm();
+  const loading = useLoading();
+
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(search.trim()), 350);
+    return () => clearTimeout(t);
+  }, [search]);
+
+  const LEADS_PAGE_SIZE = 100;
+
+  const loadLeads = useCallback(async (page = 1, resetSelection = false) => {
+    loading.start();
+    try {
+      const params = buildLeadsQueryParams({ tab, debouncedSearch, statusFilter, interestFilter });
+      params.set('page', String(page)); params.set('page_size', String(LEADS_PAGE_SIZE));
+      const qs = params.toString();
+      const data = await api.get('/leads/page' + (qs ? `?${qs}` : ''));
+      const rows = Array.isArray(data?.items) ? data.items : [];
+      setLeadsTotal(data?.total || 0);
+      setLeadsHasMore(!!data?.has_more);
+      setLeadsPage(data?.page || page);
+      setLeads(rows);
+      if (resetSelection) { setSelectedIds(new Set()); setAllSelected(false); setExcludedIds(new Set()); }
+      setEmailDrafts((prev) => {
+        const next = { ...prev };
+        rows.forEach((l) => {
+          if (next[l.id] === undefined) next[l.id] = l.email;
+        });
+        return next;
+      });
+    } catch (e) {
+      notify({ type: 'error', message: e.message || 'Failed to load leads' });
+    } finally {
+      loading.stop();
+    }
+  }, [debouncedSearch, statusFilter, interestFilter, tab, loading, notify]);
+
+  useEffect(() => {
+    loadLeads(1, true);
+  }, [loadLeads]);
+
+  const visibleIds = useMemo(() => leads.map((l) => l.id), [leads]);
+
+  const toggleOne = (id) => {
+    if (allSelected) {
+      setExcludedIds((prev) => {
+        const n = new Set(prev);
+        if (n.has(id)) n.delete(id);
+        else n.add(id);
+        return n;
+      });
+    } else {
+      setSelectedIds((prev) => {
+        const n = new Set(prev);
+        if (n.has(id)) n.delete(id);
+        else n.add(id);
+        return n;
+      });
+    }
+  };
+
+  const selectAllLeads = () => {
+    setAllSelected(true);
+    setSelectedIds(new Set());
+    setExcludedIds(new Set());
+  };
+
+  const clearLeadSelection = () => {
+    setAllSelected(false);
+    setSelectedIds(new Set());
+    setExcludedIds(new Set());
+  };
+
+  const togglePageSelection = (checked) => {
+    if (allSelected) {
+      setExcludedIds((prev) => {
+        const n = new Set(prev);
+        visibleIds.forEach((id) => {
+          if (checked) n.delete(id);
+          else n.add(id);
+        });
+        return n;
+      });
+    } else {
+      setSelectedIds((prev) => {
+        const n = new Set(prev);
+        visibleIds.forEach((id) => {
+          if (checked) n.add(id);
+          else n.delete(id);
+        });
+        return n;
+      });
+    }
+  };
+
+  const pageSelectedCount = visibleIds.filter((id) =>
+    allSelected ? !excludedIds.has(id) : selectedIds.has(id)
+  ).length;
+
+  const pageFullySelected = visibleIds.length > 0 && pageSelectedCount === visibleIds.length;
+
+  const selectedCount = allSelected
+    ? Math.max(0, leadsTotal - excludedIds.size)
+    : selectedIds.size;
+
+  // A bulk action must resolve to exactly the set the user is looking at, so the
+  // same filters that built the list are sent along with the selection. Without
+  // this, "select all" would resolve to a wider set than the user can see.
+  const selectionFilters = () => {
+    const params = buildLeadsQueryParams({ tab, debouncedSearch, statusFilter, interestFilter });
+    return {
+      q: params.get('q') || null,
+      status: params.get('status') || null,
+      bad_only: params.get('bad_only') === 'true',
+      interest: params.get('interest') || null,
+    };
+  };
+
+  const selectionPayload = () => ({
+    all_selected: allSelected,
+    lead_ids: [...selectedIds],
+    excluded_ids: [...excludedIds],
+    filters: selectionFilters(),
+  });
+
+  const handleBulkDelete = async () => {
+    if (!selectedCount) return;
+    const ok = await confirm(
+      `Permanently delete ${selectedCount.toLocaleString()} lead(s)? This removes enrollments and email history for those leads.`,
+    );
+    if (!ok) return;
+    loading.start();
+    try {
+      const res = await api.post('/leads/bulk-delete-selection', selectionPayload());
+      const n = res.deleted ?? selectedCount;
+      notify({ type: 'success', message: `Deleted ${n} lead(s).` });
+      await loadLeads(1, true);
+    } catch (e) {
+      notify({ type: 'error', message: e.message || 'Delete failed' });
+    } finally {
+      loading.stop();
+    }
+  };
+
+  const handleBulkStatus = async () => {
+    if (!selectedCount) return;
+    const ok = await confirm(
+      `Set enrollment to “${bulkEnrollmentStatus}” on every campaign for ${selectedCount.toLocaleString()} lead(s)? The send queue will be recalculated.`,
+    );
+    if (!ok) return;
+    loading.start();
+    try {
+      const res = await api.post('/leads/bulk-status', {
+        ...selectionPayload(),
+        enrollment_status: bulkEnrollmentStatus,
+      });
+      const n = res.updated ?? selectedCount;
+      notify({ type: 'success', message: `Enrollment updated on ${n} enrollment(s).` });
+      await loadLeads(1, true);
+    } catch (e) {
+      notify({ type: 'error', message: e.message || 'Update failed' });
+    } finally {
+      loading.stop();
+    }
+  };
+
+  const handleBulkReenroll = async () => {
+    if (allSelected) {
+      // Re-enroll edits a corrected email per lead, which needs the individual
+      // rows — it cannot be applied to a set the user has not looked at.
+      notify({
+        type: 'info',
+        message: 'Re-enroll needs a corrected email per lead — select the leads individually instead of "select all".',
+      });
+      return;
+    }
+    const ids = [...selectedIds];
+    const targets = ids
+      .map((id) => leads.find((l) => l.id === id))
+      .filter(Boolean)
+      .filter(
+        (l) =>
+          l.email_verification_status === 'invalid' ||
+          (l.campaigns || []).some((c) => c.status === 'bounced'),
+      );
+    if (!targets.length) {
+      notify({ type: 'info', message: 'Select bounced or invalid leads to re-enroll with a corrected email.' });
+      return;
+    }
+    const ok = await confirm(
+      `Re-enroll ${targets.length} lead(s) using the “New email” values? Status becomes active; verification runs when enabled on your account.`,
+    );
+    if (!ok) return;
+    loading.start();
+    try {
+      const items = targets
+        .map((l) => ({
+          lead_id: l.id,
+          email: (emailDrafts[l.id] ?? l.email).trim(),
+        }))
+        .filter((row) => row.email);
+      if (!items.length) {
+        notify({ type: 'error', message: 'Enter an email for each selected lead.' });
+        return;
+      }
+      const res = await api.post('/leads/bulk-recover', { items, verify_email: true });
+      const n = res.recovered ?? 0;
+      const errN = res.errors?.length ?? 0;
+      notify({
+        type: errN ? 'info' : 'success',
+        message: `Recovery started for ${n} lead(s).${errN ? ` ${errN} skipped (see API errors).` : ''}`,
+      });
+      await loadLeads(1, true);
+    } catch (e) {
+      notify({ type: 'error', message: e.message || 'Re-enroll failed' });
+    } finally {
+      loading.stop();
+    }
+  };
+
+  const recoverOne = async (lead) => {
+    const email = (emailDrafts[lead.id] ?? lead.email).trim();
+    if (!email) {
+      notify({ type: 'error', message: 'Enter an email address.' });
+      return;
+    }
+    loading.start();
+    try {
+      await api.post(`/leads/${lead.id}/recover`, { email, verify_email: true });
+      notify({ type: 'success', message: 'Lead updated. Verification or scheduling will follow your account settings.' });
+      await loadLeads(1, true);
+    } catch (e) {
+      notify({ type: 'error', message: e.message || 'Recovery failed' });
+    } finally {
+      loading.stop();
+    }
+  };
+
+  const markActiveOne = async (lead) => {
+    loading.start();
+    try {
+      await api.patch(`/leads/${lead.id}`, { enrollment_status: 'active' });
+      notify({ type: 'success', message: 'All enrollments set to active; queue recalculated.' });
+      await loadLeads(1, true);
+    } catch (e) {
+      notify({ type: 'error', message: e.message || 'Update failed' });
+    } finally {
+      loading.stop();
+    }
+  };
+
+  const exportCsv = async () => {
+    // Export covers the whole filtered set, not just the visible page — so the
+    // pagination params must NOT be sent here.
+    const params = buildLeadsQueryParams({ tab, debouncedSearch, statusFilter, interestFilter });
+    const qs = params.toString();
+    loading.start();
+    try {
+      const res = await api.download('/leads/export' + (qs ? `?${qs}` : ''));
+      const blob = await res.blob();
+      let filename = tab === TAB_BOUNCED ? 'leads-bounced-invalid.csv' : 'leads-export.csv';
+      const cd = res.headers.get('content-disposition');
+      if (cd) {
+        const m = cd.match(/filename="?([^";\n]+)"?/i);
+        if (m?.[1]) filename = m[1].trim();
+      }
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+      notify({ type: 'success', message: 'CSV downloaded.' });
+    } catch (e) {
+      notify({ type: 'error', message: e.message || 'Export failed' });
+    } finally {
+      loading.stop();
+    }
+  };
+
+  const importRecoverCsv = async (file) => {
+    const ok = await confirm(
+      'Recover leads from this CSV? The server reads id and email columns (header row or first two columns).',
+    );
+    if (!ok) return;
+    loading.start();
+    try {
+      const res = await api.upload('/leads/recover-import?verify_emails=true', file);
+      const n = res.recovered ?? 0;
+      const errN = res.errors?.length ?? 0;
+      notify({
+        type: errN ? 'info' : 'success',
+        message: `Recovered ${n} lead(s).${errN ? ` ${errN} row(s) skipped.` : ''}`,
+      });
+      await loadLeads(1, true);
+    } catch (e) {
+      notify({ type: 'error', message: e.message || 'Import failed — check CSV format and IDs.' });
+      await loadLeads(1, true);
+    } finally {
+      loading.stop();
+    }
+  };
+
+  return (
+    <div className="min-h-0 flex-1 overflow-y-auto p-8 space-y-6">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold mb-1">Leads</h1>
+          <p className="text-sm text-gray-500 max-w-2xl">
+            Search and manage contacts across campaigns. Use{' '}
+            <strong className="font-medium text-gray-700">Bounced &amp; Invalid</strong>{' '}
+            to fix addresses and put people back into the send flow (with verification when enabled).
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Button type="button" variant="outline" size="sm" onClick={exportCsv} disabled={!leads.length}>
+            Export CSV
+          </Button>
+          <FileUploadArea
+            size="sm"
+            accept=".csv,text/csv"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              e.target.value = '';
+              if (f) importRecoverCsv(f);
+            }}
+          >
+            Import recovery CSV
+          </FileUploadArea>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap gap-2">
+        <button
+          type="button"
+          onClick={() => setTab(TAB_ALL)}
+          className={cn(
+            'rounded-full border text-xs font-medium px-3 py-1.5 transition-colors',
+            tab === TAB_ALL
+              ? 'bg-teal-500 text-white border-teal-500'
+              : 'bg-white text-gray-600 border-gray-300 hover:border-teal-300 hover:bg-teal-50',
+          )}
+        >
+          All leads
+        </button>
+        <button
+          type="button"
+          onClick={() => setTab(TAB_BOUNCED)}
+          className={cn(
+            'rounded-full border text-xs font-medium px-3 py-1.5 transition-colors',
+            tab === TAB_BOUNCED
+              ? 'bg-teal-500 text-white border-teal-500'
+              : 'bg-white text-gray-600 border-gray-300 hover:border-teal-300 hover:bg-teal-50',
+          )}
+        >
+          Bounced &amp; Invalid
+        </button>
+      </div>
+
+      {tab === TAB_ALL && (
+        <div className="flex flex-wrap gap-2 items-center">
+          <span className="text-sm text-gray-500">Status:</span>
+          {STATUS_OPTIONS.map((o) => (
+            <button
+              key={o.value}
+              type="button"
+              onClick={() => setStatusFilter(o.value)}
+              className={cn(
+                'rounded-full border text-xs font-medium px-3 py-1',
+                statusFilter === o.value
+                  ? 'bg-teal-500 text-white border-teal-500'
+                  : 'bg-white text-gray-600 border-gray-300 hover:border-teal-300 hover:bg-teal-50',
+              )}
+            >
+              {o.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <div className="flex flex-wrap gap-2 items-center">
+        <span className="text-sm text-gray-500">Interest:</span>
+        {INTEREST_FILTER_OPTIONS.map((o) => (
+          <button
+            key={o.value}
+            type="button"
+            onClick={() => setInterestFilter(o.value)}
+            className={cn(
+              'rounded-full border text-xs font-medium px-3 py-1',
+              interestFilter === o.value
+                ? 'bg-emerald-600 text-white border-emerald-600'
+                : 'bg-white text-gray-600 border-gray-300 hover:border-emerald-400 hover:bg-emerald-50',
+            )}
+          >
+            {o.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === TAB_BOUNCED && (
+        <Card className="p-4 bg-amber-50/80 dark:bg-amber-900/20 border-amber-200 dark:border-amber-800">
+          <p className="text-sm text-gray-800 dark:text-gray-200">
+            Edit the email for each row, then <strong className="font-medium">Save &amp; recover</strong>. That updates the
+            lead record (all campaigns), sets status to active, and either queues verification or reschedules immediately.
+            Export bad addresses to clean them elsewhere, then import a CSV with columns <code className="font-mono text-xs">id,email</code>.
+          </p>
+        </Card>
+      )}
+
+      <div className="flex flex-wrap gap-4 items-end">
+        <div className="flex-1 min-w-[200px] max-w-md">
+          <Input
+            label="Search"
+            placeholder="Email or name…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+        </div>
+      </div>
+
+      {selectedCount > 0 && (
+        <Card className="p-4 flex flex-wrap gap-3 items-center">
+          <span className="text-sm font-medium text-gray-700">{selectedCount} selected</span>
+          <Button type="button" variant="destructive" size="sm" onClick={handleBulkDelete}>
+            Delete
+          </Button>
+          <div className="flex flex-wrap items-center gap-2">
+            <select
+              className="rounded-md border-gray-300 text-sm shadow-sm focus:ring-2 focus:ring-teal-300"
+              value={bulkEnrollmentStatus}
+              onChange={(e) => setBulkEnrollmentStatus(e.target.value)}
+            >
+              <option value="active">active</option>
+              <option value="contacted">contacted</option>
+              <option value="completed">completed</option>
+              <option value="bounced">bounced</option>
+              <option value="unsubscribed">unsubscribed</option>
+              <option value="wrong_person">wrong_person</option>
+            </select>
+            <Button type="button" variant="outline" size="sm" onClick={handleBulkStatus}>
+              Apply enrollment
+            </Button>
+          </div>
+          {(tab === TAB_BOUNCED || tab === TAB_ALL) && (
+            <Button type="button" variant="default" size="sm" onClick={handleBulkReenroll}>
+              Re-enroll (recover)
+            </Button>
+          )}
+        </Card>
+      )}
+
+      <Card className="overflow-x-auto max-w-full min-w-0">
+        <div className="px-4 py-2 text-sm text-gray-500 border-b border-gray-100">
+          {leads.length} lead{leads.length !== 1 ? 's' : ''}
+          {tab === TAB_BOUNCED ? ' (bounced or invalid)' : ''}
+        </div>
+        {pageFullySelected && !allSelected && (
+          <div className="mx-4 mt-3 flex items-center justify-between rounded-lg border border-teal-200 bg-teal-50 px-4 py-3 text-sm">
+            <span>All {pageSelectedCount} leads on this page are selected.</span>
+            <button
+              type="button"
+              className="font-medium text-teal-700 hover:underline"
+              onClick={selectAllLeads}
+            >
+              Select all {leadsTotal.toLocaleString()} leads
+            </button>
+          </div>
+        )}
+
+        {allSelected && (
+          <div className="mx-4 mt-3 flex items-center justify-between rounded-lg border border-teal-200 bg-teal-50 px-4 py-3 text-sm">
+            <span>{(leadsTotal - excludedIds.size).toLocaleString()} of {leadsTotal.toLocaleString()} leads selected.</span>
+            <button
+              type="button"
+              className="font-medium text-gray-600 hover:underline"
+              onClick={clearLeadSelection}
+            >
+              Clear selection
+            </button>
+          </div>
+        )}
+
+        <table className="min-w-max w-full table-auto border-collapse text-sm">
+          <thead>
+            <tr className="text-left text-gray-600 border-b">
+              <th className="p-2 w-10">
+                <input
+                  type="checkbox"
+                  className="rounded"
+                  checked={pageFullySelected}
+                  onChange={(e) => togglePageSelection(e.target.checked)}
+                  aria-label="Select all"
+                />
+              </th>
+              <th className="p-2">Email</th>
+              <th className="p-2">Name</th>
+              <th className="p-2">Verify / enrollments</th>
+              <th className="p-2">Campaigns</th>
+              <th className="p-2">Sending inbox</th>
+              <th className="p-2">Enrolled</th>
+              {tab === TAB_BOUNCED && <th className="p-2 min-w-[200px]">New email</th>}
+              {tab === TAB_BOUNCED && <th className="p-2 w-44">Actions</th>}
+            </tr>
+          </thead>
+          <tbody>
+            {leads.length === 0 ? (
+              <tr>
+                <td colSpan={tab === TAB_BOUNCED ? 9 : 7} className="p-8 text-center text-gray-500">
+                  No leads match this view.
+                </td>
+              </tr>
+            ) : (
+              leads.map((l) => (
+                <tr key={l.id} className="even:bg-gray-50 dark:even:bg-gray-800/40 border-b border-gray-100">
+                  <td className="p-2 align-top">
+                    <input
+                      type="checkbox"
+                      className="rounded"
+                      checked={allSelected ? !excludedIds.has(l.id) : selectedIds.has(l.id)}
+                      onChange={() => toggleOne(l.id)}
+                      aria-label={`Select ${l.email}`}
+                    />
+                  </td>
+                  <td className="p-2 align-top font-mono text-xs">
+                    <Link to={`/leads/${l.id}`} className="text-teal-600 hover:underline">
+                      {l.email}
+                    </Link>
+                  </td>
+                  <td className="p-2 align-top">{l.name || '—'}</td>
+                  <td className="p-2 align-top">
+                    <div className="flex flex-wrap gap-1">
+                      {l.email_verification_status && (
+                        <span
+                          className={cn(
+                            'rounded-full px-2 py-0.5 text-xs font-medium',
+                            statusPillClass(l.email_verification_status),
+                          )}
+                        >
+                          verify: {l.email_verification_status}
+                        </span>
+                      )}
+                      {(l.campaigns || []).slice(0, 3).map((c) => (
+                        <span
+                          key={c.campaign_id}
+                          className={cn('rounded-full px-2 py-0.5 text-xs font-medium', statusPillClass(c.status))}
+                          title={`${c.campaign_name}: ${c.status}${c.interest ? ` · ${c.interest}` : ''}`}
+                        >
+                          {c.status}
+                        </span>
+                      ))}
+                      {(l.campaigns || []).length > 3 && (
+                        <span className="text-xs text-gray-500">+{l.campaigns.length - 3}</span>
+                      )}
+                      {!(l.campaigns || []).length && !l.email_verification_status && (
+                        <span className="text-gray-400 text-xs">—</span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="p-2 align-top">
+                    <div className="flex flex-wrap gap-1 max-w-xs">
+                      {(l.campaigns || []).map((c) => (
+                        <Link
+                          key={c.campaign_id}
+                          to={`/campaigns/${c.campaign_id}#leads`}
+                          className="bg-gray-200 dark:bg-gray-600 rounded-full px-2 py-0.5 text-xs hover:bg-gray-300 dark:hover:bg-gray-500"
+                        >
+                          {c.campaign_name}
+                        </Link>
+                      ))}
+                      {!(l.campaigns || []).length && <span className="text-gray-400">—</span>}
+                    </div>
+                  </td>
+                  <td className="p-2 align-top">
+                    <div className="flex flex-col gap-1 max-w-xs">
+                      {(l.campaigns || []).map((c) => (
+                        <div key={c.campaign_id} className="text-xs">
+                          {c.from_inbox_email ? (
+                            <span className="font-mono text-gray-700" title={`${c.campaign_name}: sent from ${c.from_inbox_email}`}>
+                              {c.from_inbox_email}
+                            </span>
+                          ) : (
+                            <span className="text-gray-400">—</span>
+                          )}
+                        </div>
+                      ))}
+                      {!(l.campaigns || []).length && <span className="text-gray-400 text-xs">—</span>}
+                    </div>
+                  </td>
+                  <td className="p-2 align-top text-gray-600">{formatEnrolled(l.campaigns)}</td>
+                  {tab === TAB_BOUNCED && (
+                    <td className="p-2 align-top">
+                      <input
+                        type="email"
+                        className="w-full rounded-md border-gray-300 text-sm shadow-sm focus:ring-2 focus:ring-teal-300"
+                        value={emailDrafts[l.id] ?? l.email}
+                        onChange={(e) =>
+                          setEmailDrafts((prev) => ({
+                            ...prev,
+                            [l.id]: e.target.value,
+                          }))
+                        }
+                      />
+                    </td>
+                  )}
+                  {tab === TAB_BOUNCED && (
+                    <td className="p-2 align-top space-y-1">
+                      <Button type="button" size="sm" variant="default" onClick={() => recoverOne(l)}>
+                        Save &amp; recover
+                      </Button>
+                      <Button type="button" size="sm" variant="outline" onClick={() => markActiveOne(l)}>
+                        Active only
+                      </Button>
+                    </td>
+                  )}
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+        {leadsTotal > 0 && (
+          <div className="flex items-center justify-center gap-3 py-4">
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={leadsPage <= 1}
+              onClick={() => loadLeads(leadsPage - 1)}
+            >
+              Previous
+            </Button>
+            <span className="text-xs text-gray-500">
+              Page {leadsPage} / {Math.ceil(leadsTotal / LEADS_PAGE_SIZE)} · {leadsTotal.toLocaleString()} leads
+            </span>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={!leadsHasMore}
+              onClick={() => loadLeads(leadsPage + 1)}
+            >
+              Next
+            </Button>
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
