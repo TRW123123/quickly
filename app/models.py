@@ -7,6 +7,7 @@
 import secrets
 import uuid
 
+from sqlalchemy import func
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -999,7 +1000,7 @@ class BlocklistEntry(Base):
     value = Column(Text, nullable=False, unique=True)
     kind = Column(String(16), nullable=False, default="email")  # email | domain
     reason = Column(Text, nullable=True, default=None)
-    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    created_at = Column(DateTime, default=_utcnow, server_default=func.now(), nullable=False)
 
 
 class CampaignStartLog(Base):
