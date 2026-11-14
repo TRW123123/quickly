@@ -56,6 +56,11 @@ from app.schemas import (
     CustomEmailWrite,
     LeadSelectionRequest,
 )
+from app.email_check import (
+    apply_to_lead as apply_email_check,
+    check_emails as run_email_checks,
+    summarize as summarize_email_checks,
+)
 from app.blocklist import blocked_emails, is_blocked
 from app.deliverability import first_violation as _content_violation
 from app.lead_inbox_resolution import from_inbox_email_by_lead_campaign
@@ -2334,6 +2339,29 @@ async def remove_lead_from_campaign(
     return {"ok": True}
 
 
+def _email_check_report(checks: dict, results: list[dict]) -> dict:
+    """Import report for the free address check: skipped invalid / disposable,
+    imported role addresses, no-MX (A fallback or dead domain), DNS unknown."""
+    by_status: dict[str, list[str]] = {}
+    for r in results:
+        if r.get("email"):
+            by_status.setdefault(r.get("status") or "", []).append(r["email"])
+    added = set(by_status.get("added", []))
+    role = [e for e, c in checks.items() if "role" in c.flags and e in added]
+    no_mx = [e for e, c in checks.items() if "no_mx" in c.flags]
+    unknown = [e for e, c in checks.items() if c.status == "unknown"]
+    inv = by_status.get("invalid_email", [])
+    disp = by_status.get("disposable", [])
+    return {
+        "checked": len(checks),
+        "invalid": {"count": len(inv), "emails": inv},
+        "disposable": {"count": len(disp), "emails": disp},
+        "role": {"count": len(role), "emails": role},
+        "no_mx": {"count": len(no_mx), "emails": no_mx},
+        "unknown": {"count": len(unknown), "emails": unknown},
+    }
+
+
 @router.post("/{campaign_id}/leads")
 async def bulk_add_leads_to_campaign(
     campaign_id: int,
@@ -2341,6 +2369,7 @@ async def bulk_add_leads_to_campaign(
     skip_duplicates: bool = True,
     verify_emails: bool = False,
     confirm_only: bool = False,
+    email_check: bool = True,
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -2378,6 +2407,14 @@ async def bulk_add_leads_to_campaign(
     duplicates_in_batch = len(leads_data) - len(deduped)
     leads_data = deduped
     blocked_set = await blocked_emails(db, (e.email for e in leads_data))
+    # Free address check (syntax, MX/A, disposable, role): app/email_check.py
+    checks = (
+        await run_email_checks(
+            e.email.strip().lower() for e in leads_data
+            if e.email.strip() and e.email.strip().lower() not in blocked_set
+        )
+        if email_check else {}
+    )
 
     if confirm_only:
         from collections import defaultdict
@@ -2386,12 +2423,15 @@ async def bulk_add_leads_to_campaign(
         valid_emails = []
         invalid_format: list[str] = []
         blocked_preview: list[str] = []
+        check_skipped: list[str] = []
         for entry in leads_data:
             email = entry.email.strip().lower()
             if not email or "@" not in email:
                 invalid_format.append(entry.email or email)
             elif email in blocked_set:
                 blocked_preview.append(email)
+            elif checks.get(email) is not None and checks[email].skip_reason:
+                check_skipped.append(email)
             else:
                 valid_emails.append(email)
 
@@ -2408,12 +2448,13 @@ async def bulk_add_leads_to_campaign(
             "preview": True,
             "total_valid": len(valid_emails),
             "providers": dict(sorted(provider_counts.items(), key=lambda x: -x[1])),
-            "total_flagged": len(invalid_format) + duplicates_in_batch + len(blocked_preview),
+            "total_flagged": len(invalid_format) + duplicates_in_batch + len(blocked_preview) + len(check_skipped),
             "flagged": {
                 "invalid_format": invalid_format,
                 "duplicates_in_batch": duplicates_in_batch,
                 "blocked": blocked_preview,
             },
+            "email_check": summarize_email_checks(checks.values()),
         }
 
     results = []
@@ -2434,6 +2475,15 @@ async def bulk_add_leads_to_campaign(
         if email in blocked_set:
             blocked_leads.append(email)
             results.append({"email": email, "status": "blocked"})
+            continue
+        chk = checks.get(email)
+        if chk is not None and chk.skip_reason:
+            results.append({
+                "email": email,
+                "status": "invalid_email" if chk.skip_reason == "invalid" else "disposable",
+                "flags": chk.flags,
+                "detail": chk.reason,
+            })
             continue
 
         try:
@@ -2460,6 +2510,8 @@ async def bulk_add_leads_to_campaign(
                     changed = True
                 if changed:
                     await db.flush()
+            if chk is not None:
+                apply_email_check(lead, chk)
 
             # Check enrollment
             if skip_duplicates:
@@ -2605,6 +2657,7 @@ async def bulk_add_leads_to_campaign(
         "errors": errors,
         "results": results,
         "verification_queued": verify_emails and bool(added_lead_ids),
+        "email_check": _email_check_report(checks, results),
     }
 
 
@@ -3029,9 +3082,14 @@ async def import_campaign_leads(
     skip_duplicates: bool = True,
     verify_emails: bool = False,
     confirm_only: bool = False,
+    email_check: bool = True,
     db: AsyncSession = Depends(get_db),
 ):
-    """Import leads from a CSV file. Expects columns: email, name, and any custom fields."""
+    """Import leads from a CSV file. Expects columns: email, name, and any custom fields.
+
+    Addresses run through the free check in app/email_check.py (``email_check=false``
+    disables it): invalid syntax / no mail host and disposable domains are skipped,
+    role addresses are imported and flagged."""
     campaign_result = await db.execute(select(Campaign).where(Campaign.id == campaign_id))
     campaign_obj = campaign_result.scalar_one_or_none()
     if not campaign_obj:
@@ -3098,6 +3156,9 @@ async def import_campaign_leads(
         _blocked_csv = await blocked_emails(db, valid_emails)
         blocked_preview_csv = [e for e in valid_emails if e in _blocked_csv]
         valid_emails = [e for e in valid_emails if e not in _blocked_csv]
+        _checks_preview = await run_email_checks(valid_emails) if email_check else {}
+        _check_skipped_csv = {e for e in valid_emails if _checks_preview.get(e) and _checks_preview[e].skip_reason}
+        valid_emails = [e for e in valid_emails if e not in _check_skipped_csv]
 
         domain_cache: dict[str, str] = {}
         provider_counts: dict[str, int] = defaultdict(int)
@@ -3112,12 +3173,13 @@ async def import_campaign_leads(
             "preview": True,
             "total_valid": len(valid_emails),
             "providers": dict(sorted(provider_counts.items(), key=lambda x: -x[1])),
-            "total_flagged": len(invalid_format) + dup_count + len(blocked_preview_csv),
+            "total_flagged": len(invalid_format) + dup_count + len(blocked_preview_csv) + len(_check_skipped_csv),
             "flagged": {
                 "invalid_format": invalid_format,
                 "duplicates_in_batch": dup_count,
                 "blocked": blocked_preview_csv,
             },
+            "email_check": summarize_email_checks(_checks_preview.values()),
         }
 
     _csv_reserved_lower = frozenset(
@@ -3135,7 +3197,16 @@ async def import_campaign_leads(
     # Track new enrollments for bulk scheduling after provider detection
     new_enrollments: list[tuple[int, int, str, bool, bool]] = []  # cl.id, lead.id, email, has_prov, can_send
 
-    for row_num, row in enumerate(reader, start=2):
+    csv_rows = list(reader)
+    csv_checks: dict = {}
+    if email_check:
+        _email_keys = [k for k in (reader.fieldnames or []) if (k or "").strip().lower() == "email"]
+        if _email_keys:
+            csv_checks = await run_email_checks(
+                (r.get(_email_keys[0]) or "").strip().lower() for r in csv_rows
+            )
+
+    for row_num, row in enumerate(csv_rows, start=2):
         by_header = {}
         for fk in reader.fieldnames or []:
             h = (fk or "").strip()
@@ -3162,6 +3233,16 @@ async def import_campaign_leads(
         if await is_blocked(db, email):
             blocked_leads_csv.append(email)
             results_list.append({"row": row_num, "email": email, "status": "blocked"})
+            continue
+        chk = csv_checks.get(email)
+        if chk is not None and chk.skip_reason:
+            results_list.append({
+                "row": row_num,
+                "email": email,
+                "status": "invalid_email" if chk.skip_reason == "invalid" else "disposable",
+                "flags": chk.flags,
+                "detail": chk.reason,
+            })
             continue
 
         name = next(
@@ -3202,6 +3283,8 @@ async def import_campaign_leads(
                         changed = True
                 if changed:
                     await db.flush()
+            if chk is not None:
+                apply_email_check(lead, chk)
 
             if skip_duplicates:
                 # Global check: skip if enrolled in any campaign
@@ -3326,8 +3409,9 @@ async def import_campaign_leads(
         "blocked": len(blocked_leads_csv),
         "blocked_leads": blocked_leads_csv,
         "errors": errors,
-        "total_rows": added + already_enrolled + duplicates_in_batch + len(blocked_leads_csv) + errors,
+        "total_rows": len(results_list),
         "verification_queued": verify_emails and bool(added_lead_ids_csv),
+        "email_check": _email_check_report(csv_checks, results_list),
     }
 
 

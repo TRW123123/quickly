@@ -216,6 +216,10 @@ async def _run_migrations(conn) -> None:
         # view and quoted follow-ups reproduce what was actually sent even when
         # the template uses {{random: ...}} (which cannot be re-derived later).
         "ALTER TABLE email_log ADD COLUMN IF NOT EXISTS body TEXT NULL",
+        # 2026-11-14: free import-time address check (app/email_check.py)
+        "ALTER TABLE lead ADD COLUMN IF NOT EXISTS email_check_status VARCHAR(16) NULL",
+        "ALTER TABLE lead ADD COLUMN IF NOT EXISTS email_check_flags VARCHAR(64) NULL",
+        "ALTER TABLE lead ADD COLUMN IF NOT EXISTS email_checked_at TIMESTAMP WITHOUT TIME ZONE NULL",
     ]
     # custom_email_override table (IF NOT EXISTS — must be a separate stmt
     # because it uses raw SQL, not ALTER TABLE)
