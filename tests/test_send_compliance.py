@@ -115,7 +115,8 @@ async def test_text_mail_gets_imprint_and_unsubscribe_footer(session, sent):
 
 
 @pytest.mark.asyncio
-async def test_html_mail_with_own_unsubscribe_link_gets_only_imprint(session, sent):
+async def test_html_mail_with_own_unsubscribe_link_gets_only_imprint(session, sent, monkeypatch):
+    monkeypatch.setenv("QUICKLY_PLAINTEXT_ONLY", "0")  # legacy HTML mode
     body = '<p>Hallo</p><p><a href="{{unsubscribe_link}}">Austragen</a></p>'
     _, _, _, _, slot = await _setup(session, body=body, is_html=True)
     await jobs_mod.send_slot_job(slot.id)

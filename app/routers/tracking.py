@@ -21,7 +21,7 @@ import ipaddress
 import logging
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import Response, RedirectResponse
+from fastapi.responses import PlainTextResponse, Response, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -96,6 +96,23 @@ async def unsubscribe(
     """
     html, status = await process_unsubscribe(db, token)
     return Response(content=html, media_type="text/html", status_code=status)
+
+
+@router.post("/u/{token}", include_in_schema=False)
+async def unsubscribe_one_click(
+    token: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """RFC 8058 one-click unsubscribe (``List-Unsubscribe-Post``).
+
+    Mailbox providers POST ``List-Unsubscribe=One-Click`` here. No auth, no
+    confirmation page, idempotent: same effect as the GET link (enrollment
+    unsubscribed, queue cleared, lead status + blocklist).
+    """
+    _html, status = await process_unsubscribe(db, token)
+    if status != 200:
+        return PlainTextResponse("not found", status_code=status)
+    return PlainTextResponse("unsubscribed", status_code=200)
 
 
 @router.get("/api/caddy/ask", include_in_schema=False)

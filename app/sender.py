@@ -474,6 +474,13 @@ def _build_email_message(
     """Build an EmailMessage using Python's stdlib email module (policy.SMTP)."""
     msg = EmailMessage(policy=email.policy.SMTP)
 
+    # Global plain-text-only mode (QUICKLY_PLAINTEXT_ONLY, default on): never
+    # emit a text/html part — convert any HTML body to readable plain text.
+    from app.deliverability import html_to_plain, plaintext_only
+    if is_html and plaintext_only():
+        body = html_to_plain(_strip_html_document_wrapper(body))
+        is_html = False
+
     # Set body content first — set_content/add_alternative must be called
     # before headers are written so the MIME structure is established cleanly.
     # cte='quoted-printable' is explicit: never allow base64 on body parts.

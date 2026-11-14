@@ -299,7 +299,7 @@ async def test_failed_smtp_test_keeps_auth_cooldown(session, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_one_click_unsubscribe_flag_comes_from_campaign(session, monkeypatch):
-    """campaign.add_one_click_unsubscribe=False keeps List-Unsubscribe but drops -Post."""
+    """RFC 8058 one-click is mandatory: -Post stays on even if the campaign toggle is off."""
     inbox = await _make_smtp_inbox(session, email="brand2@example.com")
     campaign = await make_campaign(
         session,
@@ -327,5 +327,5 @@ async def test_one_click_unsubscribe_flag_comes_from_campaign(session, monkeypat
 
     await jobs_mod.send_slot_job(slot.id)
 
-    assert captured["list_unsubscribe_one_click"] is False
+    assert captured["list_unsubscribe_one_click"] is True
     assert captured["list_unsubscribe_url"]

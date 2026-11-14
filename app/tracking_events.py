@@ -13,10 +13,12 @@ import logging
 from typing import TYPE_CHECKING
 
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import time as time_provider
 from app.models import (
+    BlocklistEntry,
     CampaignLead,
     EmailClick,
     EmailLog,
@@ -176,6 +178,23 @@ async def record_email_click(db: AsyncSession, token: str, ip: str | None) -> bo
     return True
 
 
+async def _blocklist_unsubscribed(db: AsyncSession, email: str | None) -> None:
+    """Add *email* to the blocklist unless already there (exact address only)."""
+    from app.blocklist import normalize
+
+    value = normalize(email)
+    if not value or "@" not in value:
+        return
+    exists = await db.execute(select(BlocklistEntry.id).where(BlocklistEntry.value == value).limit(1))
+    if exists.first() is not None:
+        return
+    try:
+        async with db.begin_nested():
+            db.add(BlocklistEntry(value=value, kind="email", reason="unsubscribed"))
+    except IntegrityError:
+        pass  # concurrent unsubscribe already inserted it
+
+
 async def process_unsubscribe(db: AsyncSession, token: str) -> tuple[str, int]:
     """Run unsubscribe flow; return (html_body, http_status)."""
     result = await db.execute(select(LeadUnsubscribeToken).where(LeadUnsubscribeToken.token == token))
@@ -209,6 +228,13 @@ async def process_unsubscribe(db: AsyncSession, token: str) -> tuple[str, int]:
                 token,
             )
         await db.execute(delete(QueueSlot).where(QueueSlot.campaign_lead_id == cl.id))
+
+    if lead is not None:
+        # Global opt-out: lead status + blocklist entry (idempotent), so no
+        # other campaign can mail this address again.
+        if lead.status not in ("unsubscribed", "bounced", "invalid"):
+            lead.status = "unsubscribed"
+        await _blocklist_unsubscribed(db, lead.email)
 
     await db.commit()
 

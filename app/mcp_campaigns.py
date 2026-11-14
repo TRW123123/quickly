@@ -32,6 +32,7 @@ from starlette.requests import Request
 
 from app import database as _adb
 from app.blocklist import blocked_emails
+from app.deliverability import content_violation
 from app.mcp_leads import leads_mcp
 from app.models import (
     APIKey,
@@ -208,6 +209,9 @@ async def create_campaign_core(
         body = str(raw.get("body") or "").strip()
         if not body:
             raise ToolError(f"step {idx}: body is required")
+        violation = content_violation(body)
+        if violation:
+            raise ToolError(f"step {idx}: {violation}")
         subject = raw.get("subject")
         subject = str(subject).strip() if subject is not None else None
         try:
@@ -219,7 +223,8 @@ async def create_campaign_core(
         parsed_steps.append((subject or None, body, delay))
 
     # Always a draft: paused regardless of anything the caller sent.
-    campaign = Campaign(name=name, paused=True)
+    # Tracking is off for deliverability (owner decision); plain-text mail.
+    campaign = Campaign(name=name, paused=True, track_opens=False, track_clicks=False)
     db.add(campaign)
     await db.flush()
     seen_inboxes: list[int] = []

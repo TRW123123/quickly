@@ -111,7 +111,8 @@ def test_block_tags_are_styled():
     assert 'href="https://x.test"' in out
 
 
-def test_normalised_html_survives_mime_build_as_html_alternative():
+def test_normalised_html_survives_mime_build_as_html_alternative(monkeypatch):
+    monkeypatch.setenv("QUICKLY_PLAINTEXT_ONLY", "0")  # legacy HTML mode
     msg = _build_email_message(
         to_email="a@b.com",
         subject="s",

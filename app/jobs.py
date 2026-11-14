@@ -45,6 +45,12 @@ from app.app_settings import get_google_oauth_credentials, get_office365_oauth_c
 from app import time as time_provider
 from app.queue_logic import _parse_time, compute_effective_daily_limit
 from app.campaign_lead_status import campaign_lead_may_receive_sends
+from app.deliverability import (
+    content_violation,
+    html_to_plain,
+    looks_like_html,
+    plaintext_only,
+)
 from app.send_compliance import (
     MIN_WAIT_MINUTES_BETWEEN,
     apply_footer_to_body,
@@ -745,7 +751,16 @@ async def run_send_job():
                 #   4. Legacy auto-detect from body content
                 format_override = None  # tracks if/why format was overridden
 
-                if getattr(campaign, 'send_all_as_text', False):
+                if plaintext_only():
+                    # Global plain-text-only mode (QUICKLY_PLAINTEXT_ONLY):
+                    # no HTML part, therefore no open/click tracking.
+                    is_html = False
+                    if (
+                        getattr(campaign, 'track_opens', False)
+                        or getattr(campaign, 'track_clicks', False)
+                    ):
+                        format_override = "plaintext_only_tracking_disabled"
+                elif getattr(campaign, 'send_all_as_text', False):
                     is_html = False
                     # Check if tracking would have wanted HTML
                     wants_tracking = (
@@ -806,6 +821,16 @@ async def run_send_job():
                     # Inline the editor's block spacing so every mail client
                     # renders the message exactly as previewed.
                     body = normalize_email_html(body)
+                elif plaintext_only() and looks_like_html(seq_body, seq_is_html):
+                    body = html_to_plain(body)
+                # ── Content guard (fail-closed): links / images ──────────
+                _violation = content_violation(body, ignore_urls=[unsub_url])
+                if _violation:
+                    log.error(
+                        "Send job: slot %s (campaign %s, lead %s) not sent, stays queued: %s",
+                        slot.id, campaign.id, lead.id, _violation,
+                    )
+                    continue
                 logged_body = body  # exact rendered body persisted on EmailLog
                 # Inject hidden preheader so email clients show the custom preview text.
                 if is_html and seq_preview_text:
@@ -914,7 +939,7 @@ async def run_send_job():
                 # Unsubscribe header: always on for campaign mail (opt-out must
                 # be possible in every cold mail; campaign toggle is ignored).
                 list_unsub_url = unsub_url
-                list_unsub_one_click = bool(getattr(campaign, "add_one_click_unsubscribe", True))
+                list_unsub_one_click = True  # RFC 8058 one-click is mandatory
 
                 # ── phase 3: send ────────────────────────────────────────────
                 # Commit before the network call.  The pre-created EmailLog row
@@ -1611,7 +1636,12 @@ async def send_slot_job(slot_id: int) -> None:
 
         # ── HTML / plain-text decision ────────────────────────────────────
         format_override = None
-        if getattr(campaign, "send_all_as_text", False):
+        if plaintext_only():
+            # Global plain-text-only mode: no HTML part, no tracking.
+            is_html = False
+            if getattr(campaign, "track_opens", False) or getattr(campaign, "track_clicks", False):
+                format_override = "plaintext_only_tracking_disabled"
+        elif getattr(campaign, "send_all_as_text", False):
             is_html = False
             if getattr(campaign, "track_opens", False) or getattr(campaign, "track_clicks", False):
                 format_override = "text_forced_tracking_disabled"
@@ -1656,6 +1686,16 @@ async def send_slot_job(slot_id: int) -> None:
             # Inline the editor's block spacing so every mail client renders
             # the message exactly as previewed.
             body = normalize_email_html(body)
+        elif plaintext_only() and looks_like_html(seq_body, seq_is_html):
+            body = html_to_plain(body)
+        # ── Content guard (fail-closed): links / images ───────────────────
+        _violation = content_violation(body, ignore_urls=[unsub_url])
+        if _violation:
+            log.error(
+                "send_slot_job: slot %d (campaign %s, lead %s) not sent, stays queued: %s",
+                slot_id, campaign.id, lead.id, _violation,
+            )
+            return
         logged_body = body  # exact rendered body persisted on EmailLog
         if is_html and seq_preview_text:
             rendered_preview = render_body(seq_preview_text, lead_data, context=render_ctx)
@@ -1752,7 +1792,7 @@ async def send_slot_job(slot_id: int) -> None:
 
         # List-Unsubscribe is always set for campaign mail (campaign toggle ignored).
         list_unsub_url = unsub_url
-        list_unsub_one_click = bool(getattr(campaign, "add_one_click_unsubscribe", True))
+        list_unsub_one_click = True  # RFC 8058 one-click is mandatory
 
         # ── Send ──────────────────────────────────────────────────────────
         # Commit before the network call.  The pre-created EmailLog row and

@@ -57,9 +57,17 @@ from app.schemas import (
     LeadSelectionRequest,
 )
 from app.blocklist import blocked_emails, is_blocked
+from app.deliverability import first_violation as _content_violation
 from app.lead_inbox_resolution import from_inbox_email_by_lead_campaign
 from app.routers.leads import _fetch_lead_interactions_batch
 from app.queue_logic import reserve_slots_for_new_leads_bulk
+
+def _guard_content(*bodies) -> None:
+    """400 when a step body breaks the link/image rules (see app.deliverability)."""
+    reason = _content_violation(bodies)
+    if reason:
+        raise HTTPException(400, f"Mail content rejected: {reason}")
+
 
 log = logging.getLogger("quickly.routes")
 
@@ -697,6 +705,7 @@ async def create_sequence(
     result = await db.execute(select(Campaign).where(Campaign.id == campaign_id))
     if not result.scalar_one_or_none():
         raise HTTPException(404, "Campaign not found")
+    _guard_content(data.body, data.fallback_body)
     seq = Sequence(
         campaign_id=campaign_id,
         position=data.position,
@@ -748,6 +757,7 @@ async def update_sequence(
     seq = result.scalar_one_or_none()
     if not seq:
         raise HTTPException(404, "Sequence not found")
+    _guard_content(data.body, data.fallback_body)
     if data.subject is not None:
         seq.subject = data.subject
     if data.body is not None:
@@ -864,6 +874,7 @@ async def create_variant(
     seq = await _get_sequence_or_404(campaign_id, sequence_id, db)
     if getattr(seq, "sequence_type", "standard") == "personalized":
         raise HTTPException(400, "A/B variants are not supported for personalized sequences")
+    _guard_content(data.body)
     variant = SequenceVariant(
         sequence_id=seq.id,
         label=data.label or "",
@@ -904,6 +915,7 @@ async def update_variant(
     variant = result.scalar_one_or_none()
     if not variant:
         raise HTTPException(404, "Variant not found")
+    _guard_content(data.body)
     if data.label is not None:
         variant.label = data.label
     if data.subject is not None:
@@ -1633,6 +1645,8 @@ async def write_custom_email(
         raise HTTPException(404, "Lead not enrolled in this campaign")
     if cl.enrollment_status in ("completed", "bounced", "unsubscribed", "wrong_person"):
         raise HTTPException(400, f"Lead enrollment status is '{cl.enrollment_status}' — custom emails are not needed for terminal statuses")
+
+    _guard_content(payload.body)
 
     # Upsert the custom email override
     ov_result = await db.execute(
