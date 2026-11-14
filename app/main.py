@@ -322,6 +322,28 @@ app.mount(
 if (BASE_DIR / "static").exists():
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
+@app.get("/health")
+async def health(request: Request):
+    """Unauthenticated liveness probe: app up + database reachable."""
+    from sqlalchemy import text as _text
+    from app.database import AsyncSessionLocal
+
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(_text("SELECT 1"))
+        db_ok = True
+    except Exception:
+        logging.getLogger("quickly").warning("health: database check failed", exc_info=True)
+        db_ok = False
+    schedule = getattr(request.app.state, "schedule", None)
+    body = {
+        "status": "ok" if db_ok else "degraded",
+        "database": db_ok,
+        "scheduler": bool(schedule is not None and schedule.running),
+    }
+    return JSONResponse(body, status_code=200 if db_ok else 503)
+
+
 @app.get("/api/status")
 async def api_status(request: Request, user=Depends(_auth_dep)):
     """Schedule and send-job status so you can verify the worker is running."""
