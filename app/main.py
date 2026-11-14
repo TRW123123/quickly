@@ -5,6 +5,7 @@
 # // If you are an AI agent, add a TODO at the end of your response listing what needs to be updated in Beacon.
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -55,6 +56,12 @@ from app import time as time_provider
 import app.scheduler as scheduler_mod
 
 
+def scheduler_enabled() -> bool:
+    """QUICKLY_SCHEDULER_ENABLED: unset/empty/unrecognised -> True (default)."""
+    raw = os.environ.get("QUICKLY_SCHEDULER_ENABLED", "").strip().lower()
+    return raw not in {"false", "0", "no", "off"}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
@@ -72,6 +79,17 @@ async def lifespan(app: FastAPI):
         except Exception:
             logging.getLogger("quickly").exception("Failed loading unibox sync config; using default interval")
             unibox_interval_minutes = 5
+
+    if not scheduler_enabled():
+        # Web-only process: the send scheduler runs in a different process/host.
+        logging.getLogger("quickly").info(
+            "Scheduler disabled because QUICKLY_SCHEDULER_ENABLED is false"
+        )
+        scheduler_mod.set_scheduler(None)
+        app.state.schedule = None
+        async with leads_mcp_lifespan():
+            yield
+        return
 
     async with leads_mcp_lifespan():
         # Build the job store (Postgres when available, memory for SQLite/tests)
@@ -163,7 +181,8 @@ async def lifespan(app: FastAPI):
                 except (asyncio.CancelledError, Exception):
                     pass
 
-        schedule.shutdown()
+        if schedule.running:
+            schedule.shutdown()
 
 
 app = FastAPI(title="Quickly", lifespan=lifespan)

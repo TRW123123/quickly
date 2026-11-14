@@ -9,6 +9,9 @@ services:
         value: "false"
       - key: QUICKLY_MODE
         value: production
+      # Web-only instance; the scheduler runs on another host.
+      - key: QUICKLY_SCHEDULER_ENABLED
+        value: "false"
       # Provided manually in the Render dashboard (no Postgres in this blueprint):
       - key: BASE_URL
         sync: false
