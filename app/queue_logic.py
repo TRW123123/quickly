@@ -33,6 +33,14 @@ def compute_effective_daily_limit(inbox, for_date: Optional[date] = None) -> int
     """
     if isinstance(inbox, int):
         return inbox
+    # Global per-inbox cap (QUICKLY_MAX_PER_INBOX_PER_DAY) always applies on
+    # top of the inbox's own limit, also for existing inboxes in the DB.
+    from app.send_compliance import global_max_per_inbox_per_day
+    return min(_inbox_daily_limit(inbox, for_date), global_max_per_inbox_per_day())
+
+
+def _inbox_daily_limit(inbox, for_date: Optional[date] = None) -> int:
+    """Warm-up aware limit from the inbox's own settings (no global cap)."""
     if not getattr(inbox, "ramp_up_enabled", False):
         return inbox.max_emails_per_day
     ref = for_date or datetime.utcnow().date()
@@ -905,7 +913,9 @@ async def _fetch_campaign_scheduling_data(
     rows = result.all()
     # Store the full inbox object at index 1 so callers can compute the
     # date-specific warmup limit via compute_effective_daily_limit(inbox_obj, date).
-    inboxes = [(row[1].id, row[1], row[1].wait_minutes_between) for row in rows]
+    # Wait time is floored at MIN_WAIT_MINUTES_BETWEEN regardless of settings.
+    from app.send_compliance import effective_wait_minutes
+    inboxes = [(row[1].id, row[1], effective_wait_minutes(row[1])) for row in rows]
 
     result = await session.execute(
         select(Sequence).where(Sequence.campaign_id == campaign_id).order_by(Sequence.position)

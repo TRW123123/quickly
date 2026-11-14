@@ -85,8 +85,8 @@ async def list_office365_accounts(
 @router.get("/oauth/office365/authorize")
 async def office365_authorize(
     display_name: str = "",
-    max_per_day: int = 50,
-    ramp_up_enabled: bool = False,
+    max_per_day: int = 10,
+    ramp_up_enabled: bool = True,
     ramp_up_start: int = 1,
     ramp_up_step_size: int = 1,
     db: AsyncSession = Depends(get_db),
@@ -154,11 +154,11 @@ async def office365_callback(
     except (json.JSONDecodeError, TypeError):
         state_data = {}
     display_name = state_data.get("display_name", "")
-    max_per_day = state_data.get("max_per_day", 50)
-    wait_minutes_between = state_data.get("wait_minutes_between", 5)
+    max_per_day = state_data.get("max_per_day", 10)
+    wait_minutes_between = state_data.get("wait_minutes_between", 3)
     max_jitter_seconds = state_data.get("max_jitter_seconds", 180)
     tracking_domain = state_data.get("tracking_domain", "") or None
-    ramp_up_enabled = bool(state_data.get("ramp_up_enabled", False))
+    ramp_up_enabled = bool(state_data.get("ramp_up_enabled", True))
     ramp_up_start = int(state_data.get("ramp_up_start", 1))
     ramp_up_step_size = int(state_data.get("ramp_up_step_size", 1))
     source = state_data.get("source", "")

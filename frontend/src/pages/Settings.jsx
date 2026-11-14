@@ -113,6 +113,8 @@ export default function Settings() {
   const [strategy, setStrategy] = useState('priority');
   const [testMode, setTestMode] = useState(false);
   const [telemetryEnabled, setTelemetryEnabled] = useState(true);
+  const [footer, setFooter] = useState({ footer_text: '', source: 'none', max_per_inbox_per_day: null, min_wait_minutes_between: null });
+  const [footerDraft, setFooterDraft] = useState('');
   // Hub version + announcement feeds (the same GET /api/notices the floating
   // notice card reads) — the permanent Settings › About home.
   const [notices, setNotices] = useState(() => apiCache.get('/notices') || null);
@@ -307,7 +309,7 @@ export default function Settings() {
   /* ── load data ── */
   const loadAll = useCallback(async () => {
     try {
-      const [stratData, tmData, whList, evtData, aiData, provData, ipData, keysData, notifData, gmailSyncData, mcpData, telData, noticesData] = await Promise.all([
+      const [stratData, tmData, whList, evtData, aiData, provData, ipData, keysData, notifData, gmailSyncData, mcpData, telData, noticesData, footerData] = await Promise.all([
         api.get('/settings/scheduling-strategy'),
         api.get('/settings/test-mode'),
         api.get('/settings/webhooks'),
@@ -321,11 +323,13 @@ export default function Settings() {
         api.get('/settings/mcp-setup').catch(() => null),
         api.get('/settings/telemetry').catch(() => null),
         api.get('/notices').catch(() => null),
+        api.get('/settings/footer').catch(() => null),
       ]);
       setStrategy(stratData.scheduling_strategy || 'priority');
       setTestMode(tmData.test_mode || false);
       if (telData) setTelemetryEnabled(telData.telemetry_enabled !== false);
       if (noticesData) setNotices(noticesData);
+      if (footerData) { setFooter(footerData); setFooterDraft(footerData.footer_text || ''); }
       setWebhooks(whList || []);
       setEventTypes(evtData.events || []);
       // default new webhook events = all
@@ -542,6 +546,16 @@ export default function Settings() {
       await api.post('/settings/telemetry', { telemetry_enabled: val });
       setTelemetryEnabled(val);
       notify({ type: 'success', message: 'Telemetry saved' });
+    } catch (e) { notify({ type: 'error', message: e.message }); }
+  };
+
+  /* ── compliance footer (imprint) ── */
+  const submitFooter = async () => {
+    try {
+      const data = await api.put('/settings/footer', { footer_text: footerDraft });
+      setFooter(data);
+      setFooterDraft(data.footer_text || '');
+      notify({ type: 'success', message: 'Impressum gespeichert' });
     } catch (e) { notify({ type: 'error', message: e.message }); }
   };
 
@@ -911,6 +925,43 @@ export default function Settings() {
             </label>
           </div>
         </section>
+
+        {user?.role === 'admin' && (
+        <section id="settings-footer" className="mb-10 scroll-mt-6">
+          <h2 className="text-lg font-semibold mb-1 border-b border-gray-200 dark:border-gray-700 pb-2">Impressum / Pflicht-Fußzeile</h2>
+          <p className="text-xs text-gray-500 dark:text-gray-400 mb-3">
+            Wird an jede Kampagnenmail angehängt, zusammen mit einem Abmeldelink (sofern die Vorlage
+            {' '}<code>{'{{unsubscribe_link}}'}</code> nicht schon enthält). Ohne Impressum werden keine
+            Kampagnenmails versendet.
+            {footer.max_per_inbox_per_day != null && (
+              <> Versandgrenzen: höchstens {footer.max_per_inbox_per_day} Mails pro Postfach und Tag,
+              mindestens {footer.min_wait_minutes_between} Minuten Abstand.</>
+            )}
+          </p>
+          {footer.source === 'none' && (
+            <p className="text-xs text-red-600 mb-2">Kein Impressum hinterlegt – der Kampagnenversand ist blockiert.</p>
+          )}
+          {footer.source === 'env' && (
+            <p className="text-xs text-gray-500 mb-2">Aktuell aus der Umgebungsvariable QUICKLY_FOOTER_TEXT. Ein hier gespeicherter Text hat Vorrang.</p>
+          )}
+          <textarea
+            value={footerDraft}
+            onChange={e => setFooterDraft(e.target.value)}
+            rows={5}
+            maxLength={4000}
+            placeholder={footer.source === 'env' ? footer.effective_footer_text : 'Firma GmbH · Musterstraße 1 · 12345 Musterstadt\nGeschäftsführer: … · Tel. … · info@…'}
+            className="block w-full border-gray-300 dark:border-gray-600 dark:bg-gray-800 rounded-md text-sm"
+          />
+          <button
+            type="button"
+            onClick={submitFooter}
+            disabled={footerDraft === (footer.footer_text || '')}
+            className="mt-2 px-3 py-1.5 text-sm rounded-md bg-teal-600 text-white disabled:opacity-50"
+          >
+            Speichern
+          </button>
+        </section>
+        )}
 
         <section id="settings-appearance" className="mb-10 scroll-mt-6">
           <h2 className="text-lg font-semibold mb-3 border-b border-gray-200 dark:border-gray-700 pb-2">Appearance</h2>
