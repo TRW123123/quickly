@@ -150,7 +150,11 @@ async def add_campaign_leads(
     skip_duplicates: bool = True,
     verify_emails: bool = False,
 ) -> str:
-    """Add leads to a campaign. Each item should include at least email; optional name and custom_data object."""
+    """Add leads to a campaign. Each item should include at least email; optional name and custom_data object.
+
+    Addresses are checked for free (syntax, MX/A record, disposable domain, role address):
+    invalid and disposable ones are skipped, role addresses are added but flagged. The
+    response's ``email_check`` object has counts for invalid/disposable/role/no_mx/unknown."""
     headers = _outbound_headers(ctx)
     if not leads:
         return json.dumps({"error": "leads array must not be empty"})

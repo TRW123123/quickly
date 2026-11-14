@@ -70,6 +70,24 @@ def _reset_jobs_auth_cooldown():
     _inbox_auth_cooldown_until.clear()
 
 
+@pytest.fixture(autouse=True)
+def _offline_email_check_dns(monkeypatch):
+    """Lead imports run a DNS MX check (app/email_check.py); tests never hit the network.
+
+    Default: every domain has an MX record.  Tests for the check override
+    ``app.email_check._dns_lookup`` themselves.
+    """
+    import app.email_check as _ec
+
+    async def _fake_lookup(domain: str) -> str:
+        return _ec.DOMAIN_MX
+
+    _ec.clear_cache()
+    monkeypatch.setattr(_ec, "_dns_lookup", _fake_lookup)
+    yield
+    _ec.clear_cache()
+
+
 @contextlib.asynccontextmanager
 async def _noop_mcp_lifespan():
     yield

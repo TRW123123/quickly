@@ -52,9 +52,11 @@ from app.routers import system_health as system_health_router
 from app.routers import analytics as analytics_router
 from app.routers import blocklist as blocklist_router
 from app.routers import reply_inbox as reply_inbox_router
+from app.routers import crm_leads as crm_leads_router
 from app.jobs import run_send_job, run_slot_scan_job, last_send_job_run, last_send_job_sent_count, run_telemetry_heartbeat_job
 from app.unibox import queue_sync_for_all_inboxes, run_unibox_sync_job
 from app.reply_inbox import SYNC_INTERVAL_MINUTES as REPLY_INBOX_INTERVAL_MINUTES, run_reply_inbox_sync_job
+from app.crm_leads import SYNC_INTERVAL_MINUTES as CRM_LEADS_INTERVAL_MINUTES, run_crm_leads_sync_job
 from app import time as time_provider
 import app.scheduler as scheduler_mod
 
@@ -126,6 +128,16 @@ async def lifespan(app: FastAPI):
             "interval",
             minutes=REPLY_INBOX_INTERVAL_MINUTES,
             id="sync_reply_inbox",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+        # Copies positive reply_inbox rows into crm_leads (app/crm_leads.py). Never sends.
+        schedule.add_job(
+            run_crm_leads_sync_job,
+            "interval",
+            minutes=CRM_LEADS_INTERVAL_MINUTES,
+            id="sync_crm_leads",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
@@ -301,6 +313,7 @@ app.include_router(system_health_router.router, dependencies=_auth_deps)
 app.include_router(analytics_router.router, dependencies=_auth_deps)
 app.include_router(blocklist_router.router, dependencies=_auth_deps)
 app.include_router(reply_inbox_router.router, dependencies=_auth_deps)
+app.include_router(crm_leads_router.router, dependencies=_auth_deps)
 
 # lightweight public utility for MX-based provider detection
 app.include_router(email_provider_router.router)

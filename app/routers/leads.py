@@ -8,12 +8,14 @@ from datetime import datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import delete, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.campaign_lead_status import LEAD_INTERESTS, normalize_enrollment_status, normalize_interest
 from app.database import get_db
+from app.email_check import check_emails, summarize as summarize_email_checks
 from app.lead_inbox_resolution import from_inbox_email_by_lead_campaign
 from app.models import (
     Campaign,
@@ -109,6 +111,8 @@ def _lead_to_response(
         custom_data=lead.custom_data if isinstance(lead.custom_data, dict) else {},
         provider=lead.provider,
         email_verification_status=lead.email_verification_status,
+        email_check_status=getattr(lead, "email_check_status", None),
+        email_check_flags=getattr(lead, "email_check_flags", None),
         created_at=lead.created_at,
         campaigns=camps,
         interactions=interactions or [],
@@ -978,6 +982,24 @@ async def import_recover_csv(
 
     bulk_body = LeadBulkRecoverRequest(items=items, verify_email=verify_emails)
     return await bulk_recover_leads(bulk_body, background_tasks, db)
+
+
+class EmailVerifyRequest(BaseModel):
+    emails: list[str] = Field(..., min_length=1, max_length=5000)
+
+
+@router.post("/verify")
+async def verify_email_list(body: EmailVerifyRequest):
+    """Check addresses with the free self-built check (syntax, MX/A, disposable, role).
+
+    Nothing is imported or stored; DNS errors come back as ``unknown``.
+    ``import`` per address tells whether a lead import would accept it."""
+    results = await check_emails(body.emails)
+    return {
+        "results": [r.to_dict() for r in results.values()],
+        "summary": summarize_email_checks(results.values()),
+        "importable": sum(1 for r in results.values() if r.skip_reason is None),
+    }
 
 
 @router.post("", response_model=LeadResponse)

@@ -361,6 +361,8 @@ async def add_leads_core(
 
     added: list[str] = []
     errors: list[dict] = []
+    disposable: list[str] = []
+    check_report: dict = {}
     if candidates:
         payload = []
         for e, it in candidates:
@@ -386,8 +388,13 @@ async def add_leads_core(
                 duplicates.append({"email": r["email"], "reason": "already_enrolled"})
             elif st == "blocked":
                 blocked.append(r["email"])
+            elif st == "invalid_email":
+                invalid.append(r["email"])
+            elif st == "disposable":
+                disposable.append(r["email"])
             else:
                 errors.append({"email": r.get("email"), "detail": r.get("detail")})
+        check_report = result.get("email_check") or {}
     await db.flush()
     return {
         "campaign_id": campaign_id,
@@ -396,6 +403,12 @@ async def add_leads_core(
         "duplicates": {"count": len(duplicates), "emails": [d["email"] for d in duplicates], "details": duplicates},
         "blocked": {"count": len(blocked), "emails": blocked},
         "invalid": {"count": len(invalid), "emails": invalid},
+        # Free address check (app/email_check.py): disposable skipped, role imported
+        # but flagged, no_mx = no MX record (A fallback or dead domain), unknown = DNS failed.
+        "disposable": {"count": len(disposable), "emails": disposable},
+        "role": check_report.get("role") or {"count": 0, "emails": []},
+        "no_mx": check_report.get("no_mx") or {"count": 0, "emails": []},
+        "unknown": check_report.get("unknown") or {"count": 0, "emails": []},
         "errors": errors,
     }
 
@@ -710,8 +723,10 @@ async def add_leads(
 ) -> str:
     """Add leads to a campaign. leads: JSON list of {email, name?, custom_data?} (extra keys go to
     custom_data) or plain emails; or csv: CSV text with an `email` header column (name + custom columns).
-    Skips duplicates against ALL existing leads, blocklisted addresses and invalid emails.
-    Returns added/duplicates/blocked/invalid with counts and addresses."""
+    Skips duplicates against ALL existing leads, blocklisted addresses, invalid emails (syntax or
+    domain without MX/A record) and disposable domains; role addresses (info@, kontakt@ ...) are
+    added but flagged. Returns added/duplicates/blocked/invalid/disposable/role/no_mx/unknown
+    with counts and addresses."""
     return await _run(add_leads_core, campaign_id, leads, csv)
 
 

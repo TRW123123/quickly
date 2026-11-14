@@ -147,6 +147,11 @@ class Lead(Base):
     email_verification_result = Column(JSON, nullable=True, default=None)
     # Detected email hosting provider (e.g. "Google Workspace", "Office 365") via MX lookup
     provider = Column(String(64), nullable=True, default=None, index=True)
+    # Free import-time address check (app/email_check.py): valid | invalid | unknown,
+    # flags comma-separated (role, disposable, no_mx, syntax), NULL = never checked.
+    email_check_status = Column(String(16), nullable=True, default=None)
+    email_check_flags = Column(String(64), nullable=True, default=None)
+    email_checked_at = Column(DateTime, nullable=True, default=None)
     created_at = Column(DateTime, default=_utcnow)
     campaign_leads = relationship("CampaignLead", back_populates="lead", cascade="all, delete-orphan")
     email_logs = relationship("EmailLog", back_populates="lead")
@@ -480,6 +485,27 @@ class ReplyInbox(Base):
     status = Column(String(16), nullable=False, default="neu", index=True)
     created_at = Column(DateTime, default=_utcnow, nullable=False)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+
+
+class CrmLead(Base):
+    """Positive replies copied from ``reply_inbox`` for follow-up (app/crm_leads.py).
+
+    Filled by the ``sync_crm_leads`` job; one row per ``reply_inbox`` row
+    (``reply_inbox_id`` unique, plain integer without FK so deleting replies,
+    leads or campaigns is never blocked).  Quickly never sends from this table.
+    """
+    __tablename__ = "crm_leads"
+    id = Column(Integer, primary_key=True, index=True)
+    reply_inbox_id = Column(Integer, nullable=False, unique=True)
+    lead_id = Column(Integer, nullable=True, index=True)
+    name = Column(String(255), nullable=False, default="")
+    company = Column(String(255), nullable=True)
+    email = Column(String(255), nullable=False, default="")
+    campaign_id = Column(Integer, nullable=True)
+    campaign_name = Column(String(255), nullable=True)
+    replied_at = Column(DateTime, nullable=True)
+    status = Column(String(32), nullable=False, default="neu", server_default="neu", index=True)
+    created_at = Column(DateTime, default=_utcnow, server_default=func.now(), nullable=False)
 
 
 class EmailOpen(Base):
