@@ -912,6 +912,11 @@ async def bulk_recover_leads(
         if dup.scalar_one_or_none():
             errors.append({"lead_id": lead_id, "detail": "duplicate_email"})
             continue
+        from app.blocklist import is_blocked
+
+        if await is_blocked(db, norm):
+            errors.append({"lead_id": lead_id, "detail": "blocked"})
+            continue
         await _mutate_lead_recover(lead, norm, verify)
         await _after_lead_recovered(db, lead_id)
         recovered_ids.append(lead_id)
@@ -1103,6 +1108,11 @@ async def recover_lead(
     )
     if dup.scalar_one_or_none():
         raise HTTPException(409, "Another lead already uses this email address")
+
+    from app.blocklist import is_blocked
+
+    if await is_blocked(db, norm):
+        raise HTTPException(409, "Email address or domain is on the blocklist")
 
     from app.app_settings import EMAIL_VERIFICATION_ENABLED, get_setting
 

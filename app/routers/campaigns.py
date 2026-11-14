@@ -56,6 +56,7 @@ from app.schemas import (
     CustomEmailWrite,
     LeadSelectionRequest,
 )
+from app.blocklist import blocked_emails, is_blocked
 from app.lead_inbox_resolution import from_inbox_email_by_lead_campaign
 from app.routers.leads import _fetch_lead_interactions_batch
 from app.queue_logic import reserve_slots_for_new_leads_bulk
@@ -2362,6 +2363,7 @@ async def bulk_add_leads_to_campaign(
             deduped.append(entry)
     duplicates_in_batch = len(leads_data) - len(deduped)
     leads_data = deduped
+    blocked_set = await blocked_emails(db, (e.email for e in leads_data))
 
     if confirm_only:
         from collections import defaultdict
@@ -2369,10 +2371,13 @@ async def bulk_add_leads_to_campaign(
 
         valid_emails = []
         invalid_format: list[str] = []
+        blocked_preview: list[str] = []
         for entry in leads_data:
             email = entry.email.strip().lower()
             if not email or "@" not in email:
                 invalid_format.append(entry.email or email)
+            elif email in blocked_set:
+                blocked_preview.append(email)
             else:
                 valid_emails.append(email)
 
@@ -2389,10 +2394,11 @@ async def bulk_add_leads_to_campaign(
             "preview": True,
             "total_valid": len(valid_emails),
             "providers": dict(sorted(provider_counts.items(), key=lambda x: -x[1])),
-            "total_flagged": len(invalid_format) + duplicates_in_batch,
+            "total_flagged": len(invalid_format) + duplicates_in_batch + len(blocked_preview),
             "flagged": {
                 "invalid_format": invalid_format,
                 "duplicates_in_batch": duplicates_in_batch,
+                "blocked": blocked_preview,
             },
         }
 
@@ -2401,6 +2407,7 @@ async def bulk_add_leads_to_campaign(
     already_enrolled = 0
     errors = 0
     duplicate_leads: list[str] = []
+    blocked_leads: list[str] = []
     # Track new enrollments for bulk scheduling after provider detection
     new_enrollments: list[tuple[int, int, str, bool, bool]] = []  # cl.id, lead.id, email, has_prov, can_send
 
@@ -2409,6 +2416,10 @@ async def bulk_add_leads_to_campaign(
         if not email:
             results.append({"email": entry.email, "status": "error", "detail": "Empty email"})
             errors += 1
+            continue
+        if email in blocked_set:
+            blocked_leads.append(email)
+            results.append({"email": email, "status": "blocked"})
             continue
 
         try:
@@ -2575,6 +2586,8 @@ async def bulk_add_leads_to_campaign(
         "already_enrolled": already_enrolled,
         "duplicate_leads": duplicate_leads,
         "duplicates_in_batch": duplicates_in_batch,
+        "blocked": len(blocked_leads),
+        "blocked_leads": blocked_leads,
         "errors": errors,
         "results": results,
         "verification_queued": verify_emails and bool(added_lead_ids),
@@ -3068,6 +3081,10 @@ async def import_campaign_leads(
             seen.add(email)
             valid_emails.append(email)
 
+        _blocked_csv = await blocked_emails(db, valid_emails)
+        blocked_preview_csv = [e for e in valid_emails if e in _blocked_csv]
+        valid_emails = [e for e in valid_emails if e not in _blocked_csv]
+
         domain_cache: dict[str, str] = {}
         provider_counts: dict[str, int] = defaultdict(int)
         for email in valid_emails:
@@ -3081,10 +3098,11 @@ async def import_campaign_leads(
             "preview": True,
             "total_valid": len(valid_emails),
             "providers": dict(sorted(provider_counts.items(), key=lambda x: -x[1])),
-            "total_flagged": len(invalid_format) + dup_count,
+            "total_flagged": len(invalid_format) + dup_count + len(blocked_preview_csv),
             "flagged": {
                 "invalid_format": invalid_format,
                 "duplicates_in_batch": dup_count,
+                "blocked": blocked_preview_csv,
             },
         }
 
@@ -3097,6 +3115,7 @@ async def import_campaign_leads(
     errors = 0
     duplicates_in_batch = 0
     duplicate_leads: list[str] = []
+    blocked_leads_csv: list[str] = []
     results_list = []
     seen_emails: set[str] = set()
     # Track new enrollments for bulk scheduling after provider detection
@@ -3125,6 +3144,11 @@ async def import_campaign_leads(
             duplicates_in_batch += 1
             continue
         seen_emails.add(email)
+
+        if await is_blocked(db, email):
+            blocked_leads_csv.append(email)
+            results_list.append({"row": row_num, "email": email, "status": "blocked"})
+            continue
 
         name = next(
             (by_header[h] for h in raw_headers if h.lower() == "name"),
@@ -3285,8 +3309,10 @@ async def import_campaign_leads(
         "already_enrolled": already_enrolled,
         "duplicate_leads": duplicate_leads,
         "duplicates_in_batch": duplicates_in_batch,
+        "blocked": len(blocked_leads_csv),
+        "blocked_leads": blocked_leads_csv,
         "errors": errors,
-        "total_rows": added + already_enrolled + duplicates_in_batch + errors,
+        "total_rows": added + already_enrolled + duplicates_in_batch + len(blocked_leads_csv) + errors,
         "verification_queued": verify_emails and bool(added_lead_ids_csv),
     }
 

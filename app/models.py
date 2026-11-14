@@ -945,6 +945,34 @@ class EmailNotificationConfig(Base):
     user = relationship("User", back_populates="notification_config")
 
 
+class BlocklistEntry(Base):
+    """Global do-not-contact list: exact email addresses or whole domains.
+
+    ``value`` is always stored lowercase (see ``app.blocklist.normalize``).
+    Table/column names are relied upon by raw SQL in the send path — keep them stable.
+    """
+    __tablename__ = "blocklist"
+    id = Column(Integer, primary_key=True, index=True)
+    value = Column(Text, nullable=False, unique=True)
+    kind = Column(String(16), nullable=False, default="email")  # email | domain
+    reason = Column(Text, nullable=True, default=None)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+
+
+class CampaignStartLog(Base):
+    """Audit trail for every start/resume attempt made through MCP (approved or rejected)."""
+    __tablename__ = "campaign_start_log"
+    id = Column(Integer, primary_key=True, index=True)
+    # No FK: rejected attempts may reference a non-existent campaign id and must still be logged.
+    campaign_id = Column(Integer, nullable=True, index=True)
+    action = Column(String(32), nullable=False)  # start | resume
+    approved_by_safak = Column(Boolean, nullable=True, default=None)
+    api_key_id = Column(Integer, nullable=True, default=None)
+    user = Column(String(255), nullable=True, default=None)
+    result = Column(Text, nullable=False, default="")
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+
+
 # All supported webhook event types
 WEBHOOK_EVENT_TYPES = [
     "email.sent",          # An email was successfully sent to a lead

@@ -217,3 +217,7 @@ leads_mcp_http_asgi = _MCPAuthASGI(_mcp_http_handler)
 async def leads_mcp_lifespan():
     async with leads_mcp.session_manager.run():
         yield
+
+
+# Campaign / blocklist-aware tools share this server (same /api/mcp endpoint and auth).
+from app import mcp_campaigns as _mcp_campaigns  # noqa: E402,F401
