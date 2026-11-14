@@ -216,7 +216,7 @@ async def check_gmail_permissions(
 @router.get("/oauth/google/authorize")
 async def google_authorize(
     display_name: str = "",
-    max_per_day: int = 10,
+    max_per_day: int = 25,
     ramp_up_enabled: bool = True,
     ramp_up_start: int = 1,
     ramp_up_step_size: int = 1,
@@ -285,7 +285,7 @@ async def google_callback(
     except (json.JSONDecodeError, TypeError):
         state_data = {}
     display_name = state_data.get("display_name", "")
-    max_per_day = state_data.get("max_per_day", 10)
+    max_per_day = state_data.get("max_per_day", 25)
     wait_minutes_between = state_data.get("wait_minutes_between", 3)
     max_jitter_seconds = state_data.get("max_jitter_seconds", 180)
     tracking_domain = state_data.get("tracking_domain", "") or None
@@ -627,7 +627,7 @@ async def oauth_connect_redirect(
         metadata = json.loads(pending.metadata_json)
         provider = metadata["provider"]
         display_name = metadata.get("display_name", "")
-        max_per_day = metadata.get("max_per_day", 10)
+        max_per_day = metadata.get("max_per_day", 25)
         wait_minutes_between = metadata.get("wait_minutes_between", 3)
         max_jitter_seconds = metadata.get("max_jitter_seconds", 180)
         tracking_domain = metadata.get("tracking_domain", "")

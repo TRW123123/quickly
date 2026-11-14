@@ -155,7 +155,7 @@ async def test_list_inboxes_auto_disables_complete_ramp(session):
 
 @pytest.mark.asyncio
 async def test_create_inbox_with_ramp_up(session):
-    """Creating an inbox with ramp_up_enabled returns effective_max_per_day = 1."""
+    """Creating an inbox with ramp_up_enabled starts in weekly warm-up week 1 (4/day)."""
     from app.schemas import InboxCreate
     data = InboxCreate(
         email="newramp@test.com",
@@ -164,7 +164,8 @@ async def test_create_inbox_with_ramp_up(session):
     )
     result = await inbox_router.create_inbox(data, db=session)
     assert result.ramp_up_enabled is True
-    assert result.effective_max_per_day == 1  # brand new → day 0 → 1
+    assert result.ramp_up_mode == "weekly"
+    assert result.effective_max_per_day == 4  # brand new → weekly schedule week 1 → 4
 
 
 @pytest.mark.asyncio

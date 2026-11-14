@@ -115,7 +115,7 @@ class LeadBulkRecoverRequest(BaseModel):
 class InboxCreate(BaseModel):
     email: str
     display_name: str = ""
-    max_emails_per_day: int = 10
+    max_emails_per_day: int = 25
     wait_minutes_between: int = 3
     max_jitter_seconds: int = 180
     provider: INBOX_PROVIDERS = "gmail"  # gmail | office365 | smtp
@@ -124,6 +124,7 @@ class InboxCreate(BaseModel):
     ramp_up_period_days: int = 42
     ramp_up_start: int = 1
     ramp_up_step_size: int = 1
+    ramp_up_mode: Literal["weekly", "linear"] = "weekly"
 
 
 class InboxUpdate(BaseModel):
@@ -137,6 +138,7 @@ class InboxUpdate(BaseModel):
     ramp_up_period_days: Optional[int] = None
     ramp_up_start: Optional[int] = None
     ramp_up_step_size: Optional[int] = None
+    ramp_up_mode: Optional[Literal["weekly", "linear"]] = None
     paused: Optional[bool] = None
 
 
@@ -177,6 +179,12 @@ class InboxResponse(BaseModel):
     ramp_up_started_at: Optional[datetime] = None
     paused: bool = False
     ramp_up_paused_at: Optional[datetime] = None
+    ramp_up_mode: str = "weekly"
+    # 1-based warm-up week (weekly mode with ramp-up on), else None
+    warmup_week: Optional[int] = None
+    # Deliverability auto-stop (bounce/complaint rate); cleared by manual resume
+    auto_paused_at: Optional[datetime] = None
+    auto_pause_reason: Optional[str] = None
     effective_max_per_day: int = 0  # computed; 0 means use max_emails_per_day directly
     # how many emails have been sent from this inbox **today** (UTC)
     sent_today: int = 0
@@ -201,7 +209,7 @@ class ConnectUrlRequest(BaseModel):
     """Parameters for generating a one-time OAuth connect URL for a new inbox."""
     provider: str = "gmail"  # gmail | office365 (smtp inboxes need no OAuth)
     display_name: str = ""
-    max_per_day: int = 10
+    max_per_day: int = 25
     wait_minutes_between: int = 3
     max_jitter_seconds: int = 180
     tracking_domain: Optional[str] = None

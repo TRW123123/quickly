@@ -130,6 +130,19 @@ async def lifespan(app: FastAPI):
             max_instances=1,
             coalesce=True,
         )
+        # Deliverability auto-stop (app/warmup.py): pauses inboxes whose
+        # bounce/complaint rate is above threshold. Never sends anything.
+        from app.warmup import AUTO_PAUSE_CHECK_INTERVAL_MINUTES, run_auto_pause_job
+
+        schedule.add_job(
+            run_auto_pause_job,
+            "interval",
+            minutes=AUTO_PAUSE_CHECK_INTERVAL_MINUTES,
+            id="inbox_auto_pause",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
         # Anonymous usage heartbeat (app/telemetry.py). Disabled by the Settings
         # toggle or QUICKLY_TELEMETRY=false; enabled by default; fails open when the hub is
         # unreachable. Fires once shortly after boot, then every 12 hours.

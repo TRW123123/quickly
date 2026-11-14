@@ -97,7 +97,9 @@ class Inbox(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String(255), unique=True, nullable=False, index=True)
     display_name = Column(String(255), default="")
-    max_emails_per_day = Column(Integer, default=10, nullable=False)
+    # Plateau cap per inbox. In "weekly" warm-up mode the schedule
+    # (QUICKLY_WARMUP_SCHEDULE, default 4,9,15,25) ramps up to this value.
+    max_emails_per_day = Column(Integer, default=25, nullable=False)
     wait_minutes_between = Column(Integer, default=3, nullable=False)  # Minutes between emails from this inbox (scheduler floor: 3)
     max_jitter_seconds = Column(Integer, default=180, nullable=False)   # Max random seconds added to each send time (0 = disabled)
     provider = Column(String(32), default="gmail")  # gmail | office365 | smtp
@@ -121,6 +123,16 @@ class Inbox(Base):
     ramp_up_started_at = Column(DateTime, nullable=True, default=None)  # when ramp-up was (last) enabled
     paused = Column(Boolean, default=False, nullable=False)
     ramp_up_paused_at = Column(DateTime, nullable=True, default=None)  # when ramp-up was paused (for freezing warm-up)
+    # Warm-up curve: "weekly" (per-week schedule, app/warmup.py) or "linear"
+    # (legacy ramp_up_start + n * ramp_up_step_size per day).
+    ramp_up_mode = Column(String(16), default="weekly", server_default="weekly", nullable=False)
+    # Deliverability auto-stop (app/warmup.py): set when bounce/complaint rate
+    # tripped; cleared by a manual resume (PATCH paused=false).
+    auto_paused_at = Column(DateTime, nullable=True, default=None)
+    auto_pause_reason = Column(Text, nullable=True, default=None)
+    # Health window starts no earlier than this (set on manual resume so old
+    # bounces do not immediately re-trip the auto-stop).
+    auto_pause_reset_at = Column(DateTime, nullable=True, default=None)
     campaign_inboxes = relationship("CampaignInbox", back_populates="inbox")
     gmail_account = relationship("GmailAccount", back_populates="inbox", uselist=False, cascade="all, delete-orphan")
     gmail_sync_state = relationship("GmailSyncState", uselist=False, cascade="all, delete-orphan")
@@ -132,6 +144,12 @@ class Inbox(Base):
     smtp_account = relationship("SmtpAccount", back_populates="inbox", uselist=False, cascade="all, delete-orphan")
     smtp_sync_state = relationship("SmtpSyncState", uselist=False, cascade="all, delete-orphan")
     smtp_threads = relationship("SmtpThread", back_populates="inbox", cascade="all, delete-orphan")
+
+    @property
+    def warmup_week(self):
+        """1-based warm-up week in "weekly" mode, else None (computed, not stored)."""
+        from app.warmup import warmup_week
+        return warmup_week(self)
 
 
 class Lead(Base):
@@ -1003,6 +1021,28 @@ class BlocklistEntry(Base):
     created_at = Column(DateTime, default=_utcnow, server_default=func.now(), nullable=False)
 
 
+class BounceEvent(Base):
+    """One deliverability event per recipient address (app/bounces.py).
+
+    kind: hard | soft | complaint.  source: send (rejected at send time),
+    dsn (delivery status notification from mailer-daemon), arf (abuse report).
+    Used for the per-address soft-bounce counter and the per-inbox
+    bounce/complaint rate behind the auto-stop.
+    """
+    __tablename__ = "bounce_event"
+    __table_args__ = (
+        Index("ix_bounce_event_inbox_created", "inbox_id", "created_at"),
+        Index("ix_bounce_event_email_kind", "email", "kind"),
+    )
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String(255), nullable=False)
+    inbox_id = Column(Integer, ForeignKey("inbox.id", ondelete="SET NULL"), nullable=True)
+    kind = Column(String(16), nullable=False)
+    source = Column(String(16), nullable=False, default="dsn")
+    reason = Column(Text, nullable=True, default=None)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+
+
 class CampaignStartLog(Base):
     """Audit trail for every start/resume attempt made through MCP (approved or rejected)."""
     __tablename__ = "campaign_start_log"
@@ -1035,4 +1075,5 @@ WEBHOOK_EVENT_TYPES = [
     "rate_limit",          # A rate limit violation was detected
     "token_expired",       # OAuth refresh or SMTP/IMAP login failed (see data.provider/error_type)
     "inbox.send_failing",  # An SMTP inbox failed to send repeatedly (see data.last_send_error)
+    "inbox.auto_paused",   # An inbox was paused for a high bounce/complaint rate (see data.reason)
 ]

@@ -75,3 +75,21 @@ async def blocked_emails(session: AsyncSession, emails: Iterable[str]) -> set[st
     if not hits:
         return set()
     return {e for e in normed if e in hits or email_domain(e) in hits}
+
+
+async def add_email(session: AsyncSession, email: str, reason: str | None = None) -> bool:
+    """Put one exact address on the blocklist; False when it was already there.
+
+    Flushes so a second call in the same session sees the new row.
+    """
+    value = normalize(email)
+    if not value or "@" not in value:
+        return False
+    existing = await session.execute(
+        select(BlocklistEntry.id).where(BlocklistEntry.value == value).limit(1)
+    )
+    if existing.first() is not None:
+        return False
+    session.add(BlocklistEntry(value=value, kind="email", reason=(reason or None)))
+    await session.flush()
+    return True

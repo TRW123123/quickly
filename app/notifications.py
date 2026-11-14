@@ -114,6 +114,14 @@ def build_notification(event_type: str, data: dict[str, Any]) -> dict[str, Any]:
             f"and nothing is being delivered. Last error: *{error}*. "
             f"Use Diagnose inbox on the Inboxes page for a staged report."
         )
+    elif event_type == "inbox.auto_paused":
+        inbox_email = data.get("inbox_email") or "an inbox"
+        reason = data.get("reason") or "high bounce or complaint rate"
+        title = f"Inbox auto-paused — {inbox_email}"
+        message = (
+            f"**{inbox_email}** was paused automatically: {reason}. "
+            f"Clean the lead list, then resume the inbox on the Inboxes page."
+        )
     elif event_type == "token_expired":
         inbox_email = data.get("inbox_email") or "an inbox"
         provider = str(data.get("provider") or "").lower()
