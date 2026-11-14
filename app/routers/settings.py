@@ -407,6 +407,60 @@ async def set_telemetry_endpoint(
         raise HTTPException(500, f"Failed to update telemetry: {e}")
 
 
+# Compliance footer (imprint) ----------------------------------------------
+
+
+@router.get("/footer")
+async def get_footer_endpoint(
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(_require_admin),
+):
+    """Return the mandatory imprint footer for campaign mails.
+
+    ``source`` is ``db`` (saved in settings), ``env`` (QUICKLY_FOOTER_TEXT
+    fallback) or ``none`` (campaign sending is blocked until one is set).
+    """
+    from app.app_settings import get_setting
+    from app import send_compliance as sc
+
+    stored = ((await get_setting(db, sc.FOOTER_SETTING_KEY)) or "").strip()
+    env_val = sc.env_footer_text()
+    if stored:
+        source, effective = "db", stored
+    elif env_val:
+        source, effective = "env", env_val
+    else:
+        source, effective = "none", ""
+    return {
+        "footer_text": stored,
+        "effective_footer_text": effective,
+        "source": source,
+        "max_per_inbox_per_day": sc.global_max_per_inbox_per_day(),
+        "min_wait_minutes_between": sc.MIN_WAIT_MINUTES_BETWEEN,
+    }
+
+
+class _FooterPayload(_BaseModel):
+    footer_text: str = ""
+
+
+@router.put("/footer")
+async def set_footer_endpoint(
+    payload: _FooterPayload,
+    db: AsyncSession = Depends(get_db),
+    _admin=Depends(_require_admin),
+):
+    """Save the imprint footer. An empty value falls back to QUICKLY_FOOTER_TEXT."""
+    from app import send_compliance as sc
+
+    text_val = (payload.footer_text or "").strip()
+    if len(text_val) > sc.FOOTER_MAX_LENGTH:
+        raise HTTPException(400, f"Footer text too long (max {sc.FOOTER_MAX_LENGTH} characters)")
+    await sc.set_footer_text(db, text_val)
+    await db.commit()
+    return await get_footer_endpoint(db=db, _admin=_admin)
+
+
 # Survey tools / utility endpoints ----------------------------------------
 
 

@@ -85,8 +85,10 @@ def test_ramp_up_exactly_at_max():
     assert inbox_router._compute_effective_limit(inbox) == 10
 
 
-def test_ramp_up_disabled_returns_full_limit():
+def test_ramp_up_disabled_returns_full_limit(monkeypatch):
     """When ramp_up_enabled is False the original max is returned immediately."""
+    # Lift the global per-inbox cap (default 10) — this test is about ramp-up.
+    monkeypatch.setenv("QUICKLY_MAX_PER_INBOX_PER_DAY", "1000")
     inbox = _inbox_with_age(days=0, max_per_day=50, ramp_up=False)
     assert inbox_router._compute_effective_limit(inbox) == 50
 
@@ -166,8 +168,10 @@ async def test_create_inbox_with_ramp_up(session):
 
 
 @pytest.mark.asyncio
-async def test_update_inbox_disables_ramp_up(session):
+async def test_update_inbox_disables_ramp_up(session, monkeypatch):
     """Patching ramp_up_enabled=False should immediately return full limit."""
+    # Lift the global per-inbox cap (default 10) — this test is about ramp-up.
+    monkeypatch.setenv("QUICKLY_MAX_PER_INBOX_PER_DAY", "1000")
     from app.schemas import InboxUpdate
     inbox = Inbox(
         email="updateramp@test.com",

@@ -44,6 +44,16 @@ def quickly_test_logs_dir(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _default_compliance_footer(monkeypatch):
+    """Campaign sending is fail-closed without an imprint footer.
+
+    Give every test a configured footer (env fallback) so existing send tests
+    keep exercising the send path; tests for the fail-closed case remove it.
+    """
+    monkeypatch.setenv("QUICKLY_FOOTER_TEXT", "Test GmbH\nTeststr. 1, 12345 Teststadt\ninfo@test.example")
+
+
+@pytest.fixture(autouse=True)
 def _reset_jobs_auth_cooldown():
     """The send-job auth-failure circuit breaker is process-global.
 

@@ -96,8 +96,8 @@ class Inbox(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String(255), unique=True, nullable=False, index=True)
     display_name = Column(String(255), default="")
-    max_emails_per_day = Column(Integer, default=50, nullable=False)
-    wait_minutes_between = Column(Integer, default=5, nullable=False)  # Minutes between emails from this inbox
+    max_emails_per_day = Column(Integer, default=10, nullable=False)
+    wait_minutes_between = Column(Integer, default=3, nullable=False)  # Minutes between emails from this inbox (scheduler floor: 3)
     max_jitter_seconds = Column(Integer, default=180, nullable=False)   # Max random seconds added to each send time (0 = disabled)
     provider = Column(String(32), default="gmail")  # gmail | office365 | smtp
     # Custom tracking domain for this inbox (hostname only, e.g. "mail.client.com").
@@ -113,7 +113,7 @@ class Inbox(Base):
     connect_token = Column(String(256), nullable=True, unique=True)
     connect_token_expires_at = Column(DateTime, nullable=True, default=None)
     created_at = Column(DateTime, default=_utcnow)
-    ramp_up_enabled = Column(Boolean, default=False, nullable=False)
+    ramp_up_enabled = Column(Boolean, default=True, nullable=False)
     ramp_up_period_days = Column(Integer, default=42, nullable=False)  # kept for legacy compat; not used in formula
     ramp_up_start = Column(Integer, default=1, nullable=False)  # starting emails per day for ramp-up
     ramp_up_step_size = Column(Integer, default=1, nullable=False)  # emails added per day during warm-up

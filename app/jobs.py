@@ -45,6 +45,13 @@ from app.app_settings import get_google_oauth_credentials, get_office365_oauth_c
 from app import time as time_provider
 from app.queue_logic import _parse_time, compute_effective_daily_limit
 from app.campaign_lead_status import campaign_lead_may_receive_sends
+from app.send_compliance import (
+    MIN_WAIT_MINUTES_BETWEEN,
+    apply_footer_to_body,
+    effective_wait_minutes,
+    get_footer_text,
+    is_blocklisted,
+)
 
 log = logging.getLogger(__name__)
 
@@ -140,6 +147,48 @@ async def _alert_repeated_send_failure(
     )
 
 
+def _rate_limited(delta: timedelta, required: timedelta) -> bool:
+    """True if the gap since the last send of an inbox is too short.
+
+    The configured wait gets 20 seconds of slack (scheduler jitter); the
+    hard floor of ``MIN_WAIT_MINUTES_BETWEEN`` minutes never does.
+    """
+    if delta < timedelta(minutes=MIN_WAIT_MINUTES_BETWEEN):
+        return True
+    return delta + timedelta(seconds=20) < required
+
+
+FOOTER_MISSING_MESSAGE = (
+    "Kampagnenversand blockiert: kein Impressum/Pflicht-Fußzeile konfiguriert. "
+    "Bitte unter Einstellungen den Impressumstext hinterlegen "
+    "(oder Umgebungsvariable QUICKLY_FOOTER_TEXT setzen)."
+)
+
+
+async def _handle_blocklisted_lead(
+    session: AsyncSession, slot, cl: CampaignLead, lead: Lead, campaign: Campaign, match: str
+) -> None:
+    """Do not send to a blocklisted recipient: mark enrollment and drop slots."""
+    from sqlalchemy import delete as _sql_delete
+
+    log.info(
+        "Blocklist: lead_id=%s (%s) matches %r – skipping campaign %s",
+        lead.id, lead.email, match, campaign.id,
+    )
+    prev_enr = getattr(cl, "enrollment_status", None) or "active"
+    cl.enrollment_status = "unsubscribed"
+    await session.execute(_sql_delete(QueueSlot).where(QueueSlot.campaign_lead_id == cl.id))
+    await fire_webhook_event(session, "lead.status_changed", {
+        "lead_id": lead.id,
+        "lead_email": lead.email,
+        "campaign_id": campaign.id,
+        "old_enrollment_status": prev_enr,
+        "new_enrollment_status": "unsubscribed",
+        "reason": f"blocklist: {match}",
+        "timestamp": time_provider.utcnow().isoformat() + "Z",
+    })
+
+
 async def _update_enrollment_after_send(session: AsyncSession, cl: CampaignLead, campaign: Campaign, sequence: Sequence) -> None:
     n_seq = (
         await session.execute(
@@ -199,6 +248,10 @@ async def run_send_job():
         inboxes = result.scalars().all()
 
         total_sent = 0
+        # Mandatory imprint footer: without it no campaign mail goes out.
+        footer_text = await get_footer_text(session)
+        footer_missing_logged = False
+        blocklisted_cl_ids: set[int] = set()
         # Pre-fetch Google OAuth credentials once for all Gmail inboxes
         g_client_id, g_client_secret = await get_google_oauth_credentials(session)
         # Pre-fetch Office 365 OAuth credentials once for all O365 inboxes
@@ -296,6 +349,12 @@ async def run_send_job():
             if not rows:
                 continue
 
+            if not footer_text:
+                if not footer_missing_logged:
+                    log.error("Send job: %s", FOOTER_MISSING_MESSAGE)
+                    footer_missing_logged = True
+                continue
+
             # ── Fetch provider-specific credentials ──────────────────────
             gmail_token = ""
             ga = None
@@ -377,10 +436,12 @@ async def run_send_job():
 
                 # HARD LIMIT: rate/minutes between messages
                 if last_sent_time is not None:
-                    delta = now - last_sent_time
-                    required = timedelta(minutes=inbox.wait_minutes_between)
-                    # allow up to 20 second of slack before firing rate_limit
-                    if delta + timedelta(seconds=20) < required:
+                    # EmailLog.sent_at is stored in UTC (app.time.utcnow), so compare in UTC.
+                    delta = time_provider.utcnow() - last_sent_time
+                    required = timedelta(minutes=effective_wait_minutes(inbox))
+                    # allow up to 20 second of slack before firing rate_limit;
+                    # the hard floor (MIN_WAIT_MINUTES_BETWEEN) gets no slack.
+                    if _rate_limited(delta, required):
                         # Try recalculation to spread slots out
                         try:
                             from app.routers.schedule import recalculate_all_campaigns
@@ -393,14 +454,14 @@ async def run_send_job():
                                 .limit(1)
                             )
                             new_last = recheck_res.scalar_one_or_none()
-                            new_delta = now - new_last if new_last else delta
-                            if new_delta + timedelta(seconds=20) < required:
+                            new_delta = time_provider.utcnow() - new_last if new_last else delta
+                            if _rate_limited(new_delta, required):
                                 await fire_webhook_event(
                                     session, "rate_limit",
                                     {"inbox_id": inbox.id, "inbox_email": inbox.email,
                                      "last_sent": (new_last or last_sent_time).isoformat(),
                                      "now": now.isoformat(),
-                                     "wait_minutes": inbox.wait_minutes_between,
+                                     "wait_minutes": effective_wait_minutes(inbox),
                                      "recalculated": True, "resolved": False},
                                 )
                             else:
@@ -409,7 +470,7 @@ async def run_send_job():
                                     {"inbox_id": inbox.id, "inbox_email": inbox.email,
                                      "last_sent": (new_last or last_sent_time).isoformat(),
                                      "now": now.isoformat(),
-                                     "wait_minutes": inbox.wait_minutes_between,
+                                     "wait_minutes": effective_wait_minutes(inbox),
                                      "recalculated": True, "resolved": True,
                                      "message": "Rate limit was hit but resolved after recalculation"},
                                 )
@@ -422,7 +483,7 @@ async def run_send_job():
                                 {"inbox_id": inbox.id, "inbox_email": inbox.email,
                                  "last_sent": last_sent_time.isoformat(),
                                  "now": now.isoformat(),
-                                 "wait_minutes": inbox.wait_minutes_between},
+                                 "wait_minutes": effective_wait_minutes(inbox)},
                             )
                         break
                 if getattr(campaign, 'paused', False):
@@ -430,8 +491,15 @@ async def run_send_job():
                 if not _in_sending_window(now, campaign):
                     break
 
+                if cl.id in blocklisted_cl_ids:
+                    continue  # slots already removed in bulk below
                 if not campaign_lead_may_receive_sends(cl, lead):
                     await session.delete(slot)
+                    continue
+                blocked_by = await is_blocklisted(session, lead.email)
+                if blocked_by:
+                    await _handle_blocklisted_lead(session, slot, cl, lead, campaign, blocked_by)
+                    blocklisted_cl_ids.add(cl.id)
                     continue
                 if campaign.stop_on_reply:
                     reply_check = await session.execute(
@@ -834,8 +902,18 @@ async def run_send_job():
                                 _prev_plain, _from_name, _from_email, prev_sent_at
                             )
 
-                # Unsubscribe header
-                list_unsub_url = unsub_url if getattr(campaign, 'add_unsubscribe_header', True) else None
+                # ── Mandatory footer: imprint + unsubscribe link ─────────────
+                send_body = apply_footer_to_body(
+                    send_body,
+                    is_html=is_html,
+                    footer_text=footer_text,
+                    unsub_url=unsub_url,
+                    template_body=body,
+                )
+
+                # Unsubscribe header: always on for campaign mail (opt-out must
+                # be possible in every cold mail; campaign toggle is ignored).
+                list_unsub_url = unsub_url
                 list_unsub_one_click = bool(getattr(campaign, "add_one_click_unsubscribe", True))
 
                 # ── phase 3: send ────────────────────────────────────────────
@@ -973,7 +1051,7 @@ async def run_send_job():
                 total_sent += 1
                 quota_remaining -= 1
                 # update last_sent_time for rate-limit comparisons
-                last_sent_time = now
+                last_sent_time = time_provider.utcnow()
 
                 # For Gmail: save the sent message to the local mirror so the body
                 # is available for quoting in future follow-up emails.
@@ -1193,6 +1271,19 @@ async def send_slot_job(slot_id: int) -> None:
                      campaign.id, slot_id)
             return
 
+        # ── Mandatory footer (fail-closed) ───────────────────────────────
+        footer_text = await get_footer_text(session)
+        if not footer_text:
+            log.error("send_slot_job: slot %d not sent. %s", slot_id, FOOTER_MISSING_MESSAGE)
+            return
+
+        # ── Blocklist ────────────────────────────────────────────────────
+        blocked_by = await is_blocklisted(session, lead.email)
+        if blocked_by:
+            await _handle_blocklisted_lead(session, slot, cl, lead, campaign, blocked_by)
+            await session.commit()
+            return
+
         # ── Daily quota check ────────────────────────────────────────────
         today = now.date()
         max_per_day = compute_effective_daily_limit(inbox)
@@ -1222,9 +1313,10 @@ async def send_slot_job(slot_id: int) -> None:
         )
         last_sent_time = last_sent_res.scalar_one_or_none()
         if last_sent_time is not None:
-            delta = now - last_sent_time
-            required = timedelta(minutes=inbox.wait_minutes_between)
-            if delta + timedelta(seconds=20) < required:
+            # EmailLog.sent_at is stored in UTC (app.time.utcnow), so compare in UTC.
+            delta = time_provider.utcnow() - last_sent_time
+            required = timedelta(minutes=effective_wait_minutes(inbox))
+            if _rate_limited(delta, required):
                 log.info(
                     "send_slot_job: rate limit for inbox %s – "
                     "last sent %s ago (need %s), skipping slot %d",
@@ -1236,7 +1328,7 @@ async def send_slot_job(slot_id: int) -> None:
                         "inbox_id": inbox.id, "inbox_email": inbox.email,
                         "last_sent": last_sent_time.isoformat(),
                         "now": now.isoformat(),
-                        "wait_minutes": inbox.wait_minutes_between,
+                        "wait_minutes": effective_wait_minutes(inbox),
                     },
                 )
                 await session.commit()
@@ -1649,7 +1741,17 @@ async def send_slot_job(slot_id: int) -> None:
                 if _prev_plain:
                     send_body = send_body + build_quote_plain(_prev_plain, _from_name, _from_email, prev_sent_at)
 
-        list_unsub_url = unsub_url if getattr(campaign, "add_unsubscribe_header", True) else None
+        # ── Mandatory footer: imprint + unsubscribe link ──────────────────
+        send_body = apply_footer_to_body(
+            send_body,
+            is_html=is_html,
+            footer_text=footer_text,
+            unsub_url=unsub_url,
+            template_body=body,
+        )
+
+        # List-Unsubscribe is always set for campaign mail (campaign toggle ignored).
+        list_unsub_url = unsub_url
         list_unsub_one_click = bool(getattr(campaign, "add_one_click_unsubscribe", True))
 
         # ── Send ──────────────────────────────────────────────────────────

@@ -216,8 +216,8 @@ async def check_gmail_permissions(
 @router.get("/oauth/google/authorize")
 async def google_authorize(
     display_name: str = "",
-    max_per_day: int = 50,
-    ramp_up_enabled: bool = False,
+    max_per_day: int = 10,
+    ramp_up_enabled: bool = True,
     ramp_up_start: int = 1,
     ramp_up_step_size: int = 1,
     db: AsyncSession = Depends(get_db),
@@ -285,11 +285,11 @@ async def google_callback(
     except (json.JSONDecodeError, TypeError):
         state_data = {}
     display_name = state_data.get("display_name", "")
-    max_per_day = state_data.get("max_per_day", 50)
-    wait_minutes_between = state_data.get("wait_minutes_between", 5)
+    max_per_day = state_data.get("max_per_day", 10)
+    wait_minutes_between = state_data.get("wait_minutes_between", 3)
     max_jitter_seconds = state_data.get("max_jitter_seconds", 180)
     tracking_domain = state_data.get("tracking_domain", "") or None
-    ramp_up_enabled = bool(state_data.get("ramp_up_enabled", False))
+    ramp_up_enabled = bool(state_data.get("ramp_up_enabled", True))
     ramp_up_start = int(state_data.get("ramp_up_start", 1))
     ramp_up_step_size = int(state_data.get("ramp_up_step_size", 1))
     source = state_data.get("source", "")
@@ -627,11 +627,11 @@ async def oauth_connect_redirect(
         metadata = json.loads(pending.metadata_json)
         provider = metadata["provider"]
         display_name = metadata.get("display_name", "")
-        max_per_day = metadata.get("max_per_day", 50)
-        wait_minutes_between = metadata.get("wait_minutes_between", 5)
+        max_per_day = metadata.get("max_per_day", 10)
+        wait_minutes_between = metadata.get("wait_minutes_between", 3)
         max_jitter_seconds = metadata.get("max_jitter_seconds", 180)
         tracking_domain = metadata.get("tracking_domain", "")
-        ramp_up_enabled = metadata.get("ramp_up_enabled", False)
+        ramp_up_enabled = metadata.get("ramp_up_enabled", True)
         ramp_up_start = metadata.get("ramp_up_start", 1)
         ramp_up_step_size = metadata.get("ramp_up_step_size", 1)
 

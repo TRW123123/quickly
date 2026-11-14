@@ -653,11 +653,11 @@ export default function Inboxes() {
     provider: 'gmail',
     email: '',
     display_name: '',
-    max_emails_per_day: 50,
-    wait_minutes_between: 5,
+    max_emails_per_day: 10,
+    wait_minutes_between: 3,
     max_jitter_seconds: 180,
     tracking_domain: '',
-    ramp_up_enabled: false,
+    ramp_up_enabled: true,
     ramp_up_period_days: 42,
     ramp_up_start: 1,
     ramp_up_step_size: 1,
@@ -1820,7 +1820,7 @@ export default function Inboxes() {
                       </div>
                       <div>
                         <label className="block text-xs font-medium text-gray-700">Wait between emails (minutes)</label>
-                        <input type="number" name="wait_minutes_between" value={editing.wait_minutes_between || 5} onChange={e => { setEditing(prev => ({ ...prev, wait_minutes_between: +e.target.value })); setEditDirty(true); }} min={1} max={120} className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
+                        <input type="number" name="wait_minutes_between" value={editing.wait_minutes_between || 3} onChange={e => { setEditing(prev => ({ ...prev, wait_minutes_between: +e.target.value })); setEditDirty(true); }} min={3} max={120} className="mt-1 block w-full border-gray-300 rounded-md text-sm" />
                       </div>
                       <div>
                         <label className="block text-xs font-medium text-gray-700">Send time jitter (minutes)</label>
@@ -2172,7 +2172,7 @@ export default function Inboxes() {
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700">Wait between emails (minutes)</label>
-                <input type="number" name="wait_minutes_between" value={form.wait_minutes_between} onChange={handleChange} min={1} max={120} className="mt-1 block w-full border-gray-300 rounded-md" />
+                <input type="number" name="wait_minutes_between" value={form.wait_minutes_between} onChange={handleChange} min={3} max={120} className="mt-1 block w-full border-gray-300 rounded-md" />
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700">Send time jitter (minutes)</label>
