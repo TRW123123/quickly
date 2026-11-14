@@ -1016,6 +1016,9 @@ async def run_send_job():
 
                     # Mark lead as bounced and delete remaining queue slots
                     if result.error_type in ("bounce", "invalid_recipient"):
+                        # Hard → blocklist now; soft → count, 3rd → blocklist
+                        from app.bounces import record_send_rejection
+                        await record_send_rejection(session, lead.email, inbox.id, result.message)
                         prev_enr = getattr(cl, "enrollment_status", None) or "active"
                         cl.enrollment_status = "bounced"
                         # Delete ALL remaining queue slots for this lead+campaign
@@ -1860,6 +1863,9 @@ async def send_slot_job(slot_id: int) -> None:
             )
             await session.delete(email_log_entry)
             if result.error_type in ("bounce", "invalid_recipient"):
+                # Hard → blocklist now; soft → count, 3rd → blocklist
+                from app.bounces import record_send_rejection
+                await record_send_rejection(session, lead.email, inbox.id, result.message)
                 prev_enr = getattr(cl, "enrollment_status", None) or "active"
                 cl.enrollment_status = "bounced"
                 from sqlalchemy import delete as _sql_delete

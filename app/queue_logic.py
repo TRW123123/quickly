@@ -43,6 +43,10 @@ def _inbox_daily_limit(inbox, for_date: Optional[date] = None) -> int:
     """Warm-up aware limit from the inbox's own settings (no global cap)."""
     if not getattr(inbox, "ramp_up_enabled", False):
         return inbox.max_emails_per_day
+    from app.warmup import ramp_mode, weekly_daily_limit
+    if ramp_mode(inbox) == "weekly":
+        # Per-week schedule (QUICKLY_WARMUP_SCHEDULE), frozen while paused.
+        return min(weekly_daily_limit(inbox, for_date), inbox.max_emails_per_day)
     ref = for_date or datetime.utcnow().date()
     # Freeze at the pause date when the inbox is paused
     paused = getattr(inbox, "paused", False)

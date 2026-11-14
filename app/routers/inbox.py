@@ -140,6 +140,20 @@ def _compute_effective_limit(inbox: Inbox) -> int:
     return compute_effective_daily_limit(inbox)
 
 
+def _clear_auto_pause(inbox: Inbox) -> None:
+    """Manual resume after a deliverability auto-stop (app/warmup.py).
+
+    Clears the auto-pause and restarts the health window at the resume time so
+    the bounces that caused the stop do not immediately re-trip it.
+    """
+    if inbox.auto_paused_at is None:
+        return
+    log.info("Inbox %s resumed after auto-stop (%s)", inbox.email, inbox.auto_pause_reason)
+    inbox.auto_paused_at = None
+    inbox.auto_pause_reason = None
+    inbox.auto_pause_reset_at = utcnow()
+
+
 async def _maybe_complete_ramp_up(inbox: Inbox, db: AsyncSession) -> None:
     """Automatically disable ramp-up once the effective limit reaches max.
 
@@ -238,6 +252,7 @@ async def create_inbox(data: InboxCreate, db: AsyncSession = Depends(get_db)):
         ramp_up_period_days=data.ramp_up_period_days,
         ramp_up_start=data.ramp_up_start,
         ramp_up_step_size=data.ramp_up_step_size,
+        ramp_up_mode=data.ramp_up_mode,
         ramp_up_started_at=datetime.utcnow() if data.ramp_up_enabled else None,
     )
     db.add(inbox)
@@ -351,6 +366,9 @@ async def update_inbox(
             if inbox.ramp_up_enabled:
                 inbox.ramp_up_started_at = datetime.utcnow()
         inbox.ramp_up_step_size = data.ramp_up_step_size
+    if data.ramp_up_mode is not None and data.ramp_up_mode != inbox.ramp_up_mode:
+        capacity_changed = True
+        inbox.ramp_up_mode = data.ramp_up_mode
     if data.paused is not None:
         if data.paused and not inbox.paused:
             # Pausing — freeze the ramp-up clock
@@ -362,6 +380,7 @@ async def update_inbox(
                 if inbox.ramp_up_enabled and inbox.ramp_up_started_at is not None:
                     inbox.ramp_up_started_at += paused_dur
             inbox.ramp_up_paused_at = None
+            _clear_auto_pause(inbox)
         inbox.paused = data.paused
     await db.flush()
     
@@ -564,6 +583,7 @@ async def unpause_inbox(
         if inbox.ramp_up_started_at is not None:
             inbox.ramp_up_started_at += paused_dur
     inbox.ramp_up_paused_at = None
+    _clear_auto_pause(inbox)
 
     inbox.paused = False
     await db.flush()

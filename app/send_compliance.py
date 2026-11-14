@@ -6,7 +6,7 @@ of how an inbox is configured:
 * a hard minimum gap between two mails of the same inbox
   (``MIN_WAIT_MINUTES_BETWEEN``),
 * a global per-inbox daily cap (env ``QUICKLY_MAX_PER_INBOX_PER_DAY``,
-  default 10) that is enforced on top of the inbox's own limit,
+  default 30) that is enforced on top of the inbox's own limit,
 * a mandatory imprint footer (AppSetting ``compliance_footer_text`` with env
   fallback ``QUICKLY_FOOTER_TEXT``) plus unsubscribe link; without a footer
   campaign mails are not sent (fail-closed),
@@ -28,7 +28,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 log = logging.getLogger("quickly.send_compliance")
 
 MIN_WAIT_MINUTES_BETWEEN = 3
-DEFAULT_MAX_PER_INBOX_PER_DAY = 10
+# Upper bound per inbox and day.  The weekly warm-up schedule (app/warmup.py)
+# governs below it; 30 is the highest plateau the owner allows.
+DEFAULT_MAX_PER_INBOX_PER_DAY = 30
 FOOTER_SETTING_KEY = "compliance_footer_text"
 FOOTER_MAX_LENGTH = 4000
 

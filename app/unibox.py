@@ -1069,6 +1069,8 @@ async def _upsert_message_from_gmail(
     # rather than as an immediate API error.  Detect them during inbox sync and
     # mark the affected lead as bounced so it is excluded from future sends.
     if created and "SENT" not in [lbl.upper() for lbl in labels]:
+        from app.bounces import maybe_record_complaint, record_dsn_bounce
+        await maybe_record_complaint(db, inbox_id, body_plain or _strip_html_tags(body_html) or snippet)
         from_hdr = _header_value(headers_json, "From")
         from_addr_ndr = _extract_email_only(from_hdr) or from_hdr.strip()
         if _MAILER_DAEMON_RE.match(from_addr_ndr):
@@ -1077,7 +1079,12 @@ async def _upsert_message_from_gmail(
             # indicates a delivery failure.
             if not subject_hdr or _BOUNCE_SUBJECT_RE.search(subject_hdr):
                 bounced_addr = _extract_bounced_recipient(body_plain, body_html, snippet)
-                if bounced_addr:
+                # hard → mark lead bounced + blocklist; soft → count only; delay → ignore
+                bounced_kind = await record_dsn_bounce(
+                    db, bounced_addr, inbox_id,
+                    subject_hdr + "\n" + (body_plain or _strip_html_tags(body_html) or snippet),
+                ) if bounced_addr else None
+                if bounced_addr and bounced_kind == "hard":
                     b_lead_res = await db.execute(
                         select(Lead).where(func.lower(Lead.email) == bounced_addr)
                     )
@@ -1659,12 +1666,19 @@ async def _process_smtp_inbound_message(
     subject_hdr = parsed.get("subject", "") or ""
 
     # ---------- NDR / bounce detection ----------
+    from app.bounces import maybe_record_complaint, record_dsn_bounce
+    _ndr_text = parsed.get("body_plain", "") or _strip_html_tags(parsed.get("body_html", "")) or parsed.get("snippet", "")
+    await maybe_record_complaint(db, inbox.id, _ndr_text)
     if _MAILER_DAEMON_RE.match(from_addr):
         if not subject_hdr or _BOUNCE_SUBJECT_RE.search(subject_hdr):
             bounced_addr = _extract_bounced_recipient(
                 parsed.get("body_plain", ""), parsed.get("body_html", ""), parsed.get("snippet", "")
             )
-            if bounced_addr:
+            # hard → mark lead bounced + blocklist; soft → count only; delay → ignore
+            bounced_kind = await record_dsn_bounce(
+                db, bounced_addr, inbox.id, subject_hdr + "\n" + _ndr_text
+            ) if bounced_addr else None
+            if bounced_addr and bounced_kind == "hard":
                 b_lead_res = await db.execute(select(Lead).where(func.lower(Lead.email) == bounced_addr))
                 b_lead = b_lead_res.scalar_one_or_none()
                 if b_lead is not None:
@@ -3947,10 +3961,14 @@ async def _detect_o365_lead_replies(
     # ── NDR / delayed bounce detection ────────────────────────────────────
     # After processing normal lead replies, iterate again over the same batch
     # looking for mailer-daemon / postmaster bounce notifications.
+    from app.bounces import maybe_record_complaint, record_dsn_bounce
     for msg in messages:
         from_data = msg.get("from", {}) or {}
         from_ea = from_data.get("emailAddress", {}) or {}
         from_addr_ndr = str(from_ea.get("address", "")).lower()
+
+        _o365_body = msg.get("body", {}) or {}
+        await maybe_record_complaint(db, inbox.id, _strip_html_tags(str(_o365_body.get("content", ""))))
 
         if not _MAILER_DAEMON_RE.match(from_addr_ndr):
             continue
@@ -3967,6 +3985,11 @@ async def _detect_o365_lead_replies(
 
         bounced_addr = _extract_bounced_recipient(body_plain_ndr, body_html_ndr)
         if not bounced_addr:
+            continue
+        # hard → mark lead bounced + blocklist; soft → count only; delay → ignore
+        if await record_dsn_bounce(
+            db, bounced_addr, inbox.id, subject_ndr + "\n" + body_plain_ndr
+        ) != "hard":
             continue
 
         b_lead_res = await db.execute(

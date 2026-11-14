@@ -220,6 +220,14 @@ async def _run_migrations(conn) -> None:
         "ALTER TABLE lead ADD COLUMN IF NOT EXISTS email_check_status VARCHAR(16) NULL",
         "ALTER TABLE lead ADD COLUMN IF NOT EXISTS email_check_flags VARCHAR(64) NULL",
         "ALTER TABLE lead ADD COLUMN IF NOT EXISTS email_checked_at TIMESTAMP WITHOUT TIME ZONE NULL",
+        # 2026-11-14: weekly warm-up mode + deliverability auto-stop (app/warmup.py).
+        # Existing rows get 'weekly', so every inbox that still ramps follows the
+        # weekly schedule from its ramp_up_started_at (fallback created_at).
+        "ALTER TABLE inbox ADD COLUMN IF NOT EXISTS ramp_up_mode VARCHAR(16) NOT NULL DEFAULT 'weekly'",
+        "ALTER TABLE inbox ADD COLUMN IF NOT EXISTS auto_paused_at TIMESTAMP WITHOUT TIME ZONE NULL",
+        "ALTER TABLE inbox ADD COLUMN IF NOT EXISTS auto_pause_reason TEXT NULL",
+        "ALTER TABLE inbox ADD COLUMN IF NOT EXISTS auto_pause_reset_at TIMESTAMP WITHOUT TIME ZONE NULL",
+        # bounce_event itself is created by create_all (app.models.BounceEvent).
     ]
     # custom_email_override table (IF NOT EXISTS — must be a separate stmt
     # because it uses raw SQL, not ALTER TABLE)
@@ -255,6 +263,27 @@ async def _run_migrations(conn) -> None:
             "CREATE TABLE IF NOT EXISTS _app_schema_migrations (id VARCHAR(128) PRIMARY KEY)"
         )
     )
+
+    # 2026-11-14: inboxes still warming up at the old default cap of 10/day
+    # get the new plateau 25 so the weekly schedule (4/9/15/25) governs.
+    # One-time only: a cap set to 10 later on purpose stays untouched.
+    once_cap = await conn.execute(
+        text(
+            """
+            INSERT INTO _app_schema_migrations (id)
+            VALUES ('20261114_weekly_warmup_cap_25')
+            ON CONFLICT (id) DO NOTHING
+            RETURNING id
+            """
+        )
+    )
+    if once_cap.fetchone() is not None:
+        await conn.execute(
+            text(
+                "UPDATE inbox SET max_emails_per_day = 25 "
+                "WHERE ramp_up_enabled = TRUE AND max_emails_per_day = 10"
+            )
+        )
 
     # Backfill enrollment from legacy lead.status + interest.
     # Sync from lead.status must run once only: enrollment is authoritative afterward; API updates cl only.

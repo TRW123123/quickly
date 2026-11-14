@@ -204,11 +204,11 @@ async def test_global_daily_cap_overrides_higher_inbox_limit(session, sent, monk
 
 def test_global_cap_default_and_inbox_minimum(monkeypatch):
     monkeypatch.delenv("QUICKLY_MAX_PER_INBOX_PER_DAY", raising=False)
-    assert sc.global_max_per_inbox_per_day() == 10
-    assert compute_effective_daily_limit(Inbox(max_emails_per_day=50, ramp_up_enabled=False)) == 10
+    assert sc.global_max_per_inbox_per_day() == 30
+    assert compute_effective_daily_limit(Inbox(max_emails_per_day=50, ramp_up_enabled=False)) == 30
     assert compute_effective_daily_limit(Inbox(max_emails_per_day=4, ramp_up_enabled=False)) == 4
     monkeypatch.setenv("QUICKLY_MAX_PER_INBOX_PER_DAY", "kaputt")
-    assert sc.global_max_per_inbox_per_day() == 10
+    assert sc.global_max_per_inbox_per_day() == 30
 
 
 # ── Blocklist ───────────────────────────────────────────────────────────────
@@ -271,14 +271,14 @@ async def test_new_inbox_defaults(session):
     inbox = Inbox(email="neu@test.com")
     session.add(inbox)
     await session.flush()
-    assert inbox.max_emails_per_day == 10
+    assert inbox.max_emails_per_day == 25
     assert inbox.wait_minutes_between == 3
     assert inbox.ramp_up_enabled is True
 
     data = InboxCreate(email="x@test.com")
-    assert (data.max_emails_per_day, data.wait_minutes_between, data.ramp_up_enabled) == (10, 3, True)
+    assert (data.max_emails_per_day, data.wait_minutes_between, data.ramp_up_enabled) == (25, 3, True)
     req = ConnectUrlRequest()
-    assert (req.max_per_day, req.wait_minutes_between, req.ramp_up_enabled) == (10, 3, True)
+    assert (req.max_per_day, req.wait_minutes_between, req.ramp_up_enabled) == (25, 3, True)
 
 
 # ── Settings endpoint ───────────────────────────────────────────────────────
