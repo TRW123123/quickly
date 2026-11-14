@@ -438,6 +438,49 @@ class LeadReply(Base):
     campaign = relationship("Campaign", back_populates="replies")
 
 
+class ReplyInbox(Base):
+    """Read model of lead replies for external bots (they read it directly in Postgres).
+
+    One row per ``lead_reply`` row, filled idempotently by the ``sync_reply_inbox``
+    job (app/reply_inbox.py).  Quickly never answers or sends from this table.
+
+    status: ``neu`` (default, for bots), ``gesehen`` / ``erledigt`` (set by bots via
+    PATCH /api/reply-inbox/{id} or directly), ``auto`` (out-of-office, auto-reply,
+    bounce: kept for the record, but bots should only look at ``neu``).
+    is_positive: True = interested, False = negative/automatic, NULL = real reply
+    that nobody has classified yet (classification ``unklassifiziert_echt``).
+    lead_id / campaign_id / inbox_id are plain integers on purpose (no FK), so
+    deleting leads, campaigns or inboxes is never blocked by this table.
+    """
+    __tablename__ = "reply_inbox"
+    __table_args__ = (
+        Index("ix_reply_inbox_status_received", "status", "received_at"),
+        Index("ix_reply_inbox_lead_campaign", "lead_id", "campaign_id"),
+    )
+    id = Column(Integer, primary_key=True, index=True)
+    lead_reply_id = Column(
+        Integer, ForeignKey("lead_reply.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    lead_id = Column(Integer, nullable=False)
+    campaign_id = Column(Integer, nullable=False)
+    inbox_id = Column(Integer, nullable=True)
+    inbox_email = Column(String(255), nullable=True)
+    from_email = Column(String(255), nullable=False, default="")
+    from_name = Column(String(255), nullable=False, default="")
+    company = Column(String(255), nullable=True)
+    subject = Column(Text, nullable=False, default="")
+    snippet = Column(String(500), nullable=False, default="")
+    received_at = Column(DateTime, nullable=True)
+    classification = Column(Text, nullable=True)
+    # "quickly" = taken from Quickly's own classification (AI or manual),
+    # "heuristik" = deterministic keyword fallback in app/reply_inbox.py
+    classification_source = Column(String(16), nullable=True)
+    is_positive = Column(Boolean, nullable=True)
+    status = Column(String(16), nullable=False, default="neu", index=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+
+
 class EmailOpen(Base):
     __tablename__ = "email_open"
     id = Column(Integer, primary_key=True, index=True)

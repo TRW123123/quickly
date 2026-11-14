@@ -51,8 +51,10 @@ from app.routers import notices as notices_router
 from app.routers import system_health as system_health_router
 from app.routers import analytics as analytics_router
 from app.routers import blocklist as blocklist_router
+from app.routers import reply_inbox as reply_inbox_router
 from app.jobs import run_send_job, run_slot_scan_job, last_send_job_run, last_send_job_sent_count, run_telemetry_heartbeat_job
 from app.unibox import queue_sync_for_all_inboxes, run_unibox_sync_job
+from app.reply_inbox import SYNC_INTERVAL_MINUTES as REPLY_INBOX_INTERVAL_MINUTES, run_reply_inbox_sync_job
 from app import time as time_provider
 import app.scheduler as scheduler_mod
 
@@ -116,6 +118,17 @@ async def lifespan(app: FastAPI):
             hours=6,
             id="office365_graph_subscription_renewal",
             replace_existing=True,
+        )
+        # Copies lead replies into reply_inbox for external bots (app/reply_inbox.py).
+        # Read/classify only: this job never sends or answers mail.
+        schedule.add_job(
+            run_reply_inbox_sync_job,
+            "interval",
+            minutes=REPLY_INBOX_INTERVAL_MINUTES,
+            id="sync_reply_inbox",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
         )
         # Anonymous usage heartbeat (app/telemetry.py). Disabled by the Settings
         # toggle or QUICKLY_TELEMETRY=false; enabled by default; fails open when the hub is
@@ -287,6 +300,7 @@ app.include_router(notices_router.router, dependencies=_auth_deps)
 app.include_router(system_health_router.router, dependencies=_auth_deps)
 app.include_router(analytics_router.router, dependencies=_auth_deps)
 app.include_router(blocklist_router.router, dependencies=_auth_deps)
+app.include_router(reply_inbox_router.router, dependencies=_auth_deps)
 
 # lightweight public utility for MX-based provider detection
 app.include_router(email_provider_router.router)
