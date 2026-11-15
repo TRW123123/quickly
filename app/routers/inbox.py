@@ -195,6 +195,7 @@ async def _attach_smtp_health(db: AsyncSession, inboxes: list[Inbox]) -> None:
         )
         inbox.last_send_error = sa.last_send_error or ""
         inbox.last_send_at = sa.last_send_at
+        inbox.smtp_host = sa.smtp_host or ""
 
 
 @router.get("", response_model=list[InboxResponse])

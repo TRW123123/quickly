@@ -85,6 +85,21 @@ function diagnosticReportToText(report) {
   return lines.join('\n');
 }
 
+/** Provider label + colour for the inbox list (Google / Microsoft / Strato / other SMTP host). */
+function inboxProviderBadge(inbox) {
+  if (inbox.provider === 'gmail') {
+    return { label: 'Google', cls: 'bg-red-50 text-red-700', title: 'Gmail / Google Workspace' };
+  }
+  if (inbox.provider === 'office365') {
+    return { label: 'Microsoft', cls: 'bg-sky-50 text-sky-700', title: 'Office 365 / Outlook' };
+  }
+  const host = (inbox.smtp_host || '').toLowerCase();
+  if (host.includes('strato')) {
+    return { label: 'Strato', cls: 'bg-orange-50 text-orange-700', title: `SMTP: ${inbox.smtp_host}` };
+  }
+  return { label: 'SMTP', cls: 'bg-gray-100 text-gray-600', title: host ? `SMTP: ${inbox.smtp_host}` : 'SMTP' };
+}
+
 /** Staged diagnostic report: ✅/❌ per stage, verdict, fix hints, copy button. */
 function SmtpDiagnosticReport({ report, onTrySsl, onTryStarttls, busy }) {
   const [expanded, setExpanded] = useState({});
@@ -1607,30 +1622,44 @@ export default function Inboxes() {
                         )}
                       </div>
                     </div>
-                    {/* Right: badges + sent count */}
-                    <div className="flex items-center gap-2 shrink-0">
-                      {warmupActive && (
-                        <span className="text-xs bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full font-medium">
-                          Stage {inbox.effective_max_per_day}/{inbox.max_emails_per_day}
-                        </span>
-                      )}
-                      <span className="text-xs text-gray-500">
+                    {/* Right: fixed-width columns so every row lines up */}
+                    <div className="flex items-center gap-3 shrink-0">
+                      {/* Provider (Google / Microsoft / Strato / SMTP host) */}
+                      {(() => {
+                        const pv = inboxProviderBadge(inbox);
+                        return (
+                          <span className="w-24 flex justify-center">
+                            <span className={`text-xs px-2 py-0.5 rounded-full font-medium whitespace-nowrap ${pv.cls}`} title={pv.title}>{pv.label}</span>
+                          </span>
+                        );
+                      })()}
+                      {/* Warm-up stage (column stays reserved when empty) */}
+                      <span className="w-20 flex justify-center">
+                        {warmupActive && (
+                          <span className="text-xs bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full font-medium whitespace-nowrap">
+                            Stage {inbox.effective_max_per_day}/{inbox.max_emails_per_day}
+                          </span>
+                        )}
+                      </span>
+                      <span className="w-24 text-xs text-gray-500 text-right whitespace-nowrap tabular-nums">
                         <span className="font-semibold text-gray-800">{sentToday}</span>
                         <span className="text-gray-400"> / {maxToday} sent</span>
                       </span>
-                      {inbox.paused
-                        ? <span className="text-xs bg-orange-100 text-orange-700 px-2 py-0.5 rounded-full font-medium">Paused</span>
-                        : inbox.health === 'failing'
-                          ? <span className="text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded-full font-medium" title={inbox.last_send_error || ''}>Failing</span>
-                          : inbox.provider === 'smtp' && inbox.health === 'unknown'
-                            ? <span className="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full font-medium">Unknown</span>
-                            : <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full font-medium">Active</span>
-                      }
-                      {expiredInboxIds.has(inbox.id) && (
-                        <span className="text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded-full font-medium">
-                          Token Expired
-                        </span>
-                      )}
+                      <span className="w-28 flex items-center justify-center gap-1">
+                        {inbox.paused
+                          ? <span className="text-xs bg-orange-100 text-orange-700 px-2 py-0.5 rounded-full font-medium">Paused</span>
+                          : inbox.health === 'failing'
+                            ? <span className="text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded-full font-medium" title={inbox.last_send_error || ''}>Failing</span>
+                            : inbox.provider === 'smtp' && inbox.health === 'unknown'
+                              ? <span className="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full font-medium">Unknown</span>
+                              : <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full font-medium">Active</span>
+                        }
+                        {expiredInboxIds.has(inbox.id) && (
+                          <span className="text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded-full font-medium whitespace-nowrap">
+                            Token Expired
+                          </span>
+                        )}
+                      </span>
                       <svg className={`w-4 h-4 text-gray-400 transition-transform duration-200 ${isSelected ? 'rotate-90' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
                       </svg>

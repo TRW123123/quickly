@@ -198,6 +198,9 @@ class InboxResponse(BaseModel):
     health: Optional[str] = None
     last_send_error: str = ""
     last_send_at: Optional[datetime] = None
+    # SMTP server host name only (no credentials); lets the UI label the provider
+    # (e.g. Strato) next to an SMTP inbox. Empty for OAuth providers.
+    smtp_host: str = ""
 
     class Config:
         from_attributes = True
