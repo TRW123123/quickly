@@ -83,6 +83,33 @@ export function AuthProvider({ children }) {
     setUser(null);
   }, []);
 
+  const loginWithPassword = useCallback(async (username, password) => {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    if (!res.ok) {
+      let msg = 'Sign-in failed';
+      try {
+        const j = await res.json();
+        if (typeof j.detail === 'string') msg = j.detail;
+      } catch { /* ignore */ }
+      throw new Error(msg);
+    }
+    const data = await res.json();
+    _accessToken = data.access_token;
+    const userRes = await fetch('/api/auth/me', {
+      headers: { Authorization: `Bearer ${_accessToken}` },
+    });
+    if (!userRes.ok) {
+      _accessToken = null;
+      throw new Error('Sign-in failed');
+    }
+    setUser(await userRes.json());
+  }, []);
+
   const checkSetup = useCallback(async () => {
     try {
       const res = await fetch('/api/auth/setup-status');
@@ -118,6 +145,7 @@ export function AuthProvider({ children }) {
       loading,
       setupComplete,
       logout,
+      loginWithPassword,
       refreshToken,
       checkSetup,
     }}>

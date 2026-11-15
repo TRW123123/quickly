@@ -18,7 +18,11 @@ function parseDetailMessage(text) {
 }
 
 export default function Login() {
-  const { setupComplete } = useAuth();
+  const { setupComplete, loginWithPassword } = useAuth();
+  const [pwUsername, setPwUsername] = useState('');
+  const [pwPassword, setPwPassword] = useState('');
+  const [pwBusy, setPwBusy] = useState(false);
+  const [pwError, setPwError] = useState(null);
   const [restoreExpanded, setRestoreExpanded] = useState(false);
   const [restoreFile, setRestoreFile] = useState(null);
   const [restoreFileKey, setRestoreFileKey] = useState(0);
@@ -83,6 +87,19 @@ export default function Login() {
     setRestoreMsg(null);
   };
 
+  const submitPasswordLogin = async e => {
+    e.preventDefault();
+    setPwBusy(true);
+    setPwError(null);
+    try {
+      await loginWithPassword(pwUsername.trim(), pwPassword);
+    } catch (err) {
+      setPwError(err.message || 'Sign-in failed');
+    } finally {
+      setPwBusy(false);
+    }
+  };
+
   const heading = isFirstUser
     ? 'Create your admin account'
     : 'Sign in to your account';
@@ -106,6 +123,42 @@ export default function Login() {
             {heading}
           </h2>
         </div>
+
+        {!isFirstUser && (
+          <form onSubmit={submitPasswordLogin} className="mt-8 space-y-3">
+            <input
+              type="text"
+              name="username"
+              autoComplete="username"
+              placeholder="Username"
+              required
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
+              value={pwUsername}
+              onChange={e => setPwUsername(e.target.value)}
+              disabled={pwBusy}
+            />
+            <input
+              type="password"
+              name="password"
+              autoComplete="current-password"
+              placeholder="Password"
+              required
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
+              value={pwPassword}
+              onChange={e => setPwPassword(e.target.value)}
+              disabled={pwBusy}
+            />
+            <button
+              type="submit"
+              disabled={pwBusy || !pwUsername || !pwPassword}
+              className="w-full py-2.5 px-4 rounded-lg text-sm font-medium text-white bg-gray-900 hover:bg-gray-800 disabled:opacity-50"
+            >
+              {pwBusy ? 'Signing in…' : 'Sign in'}
+            </button>
+            {pwError && <p className="text-center text-xs text-red-600">{pwError}</p>}
+            <p className="text-center text-xs text-gray-400">or</p>
+          </form>
+        )}
 
         <div className="mt-8 space-y-4">
           <a
