@@ -273,6 +273,11 @@ def test_gmail_raw_mime_carries_both_unsubscribe_headers():
 
 # ── 5. One-click POST unsubscribe ───────────────────────────────────────────
 
+class _Req:
+    """Minimal request stand-in: no headers, no body."""
+    headers: dict = {}
+    client = None
+
 @pytest.mark.asyncio
 async def test_post_unsubscribe_marks_lead_and_blocklists(session, monkeypatch):
     async def _noop(*a, **k):
@@ -287,10 +292,10 @@ async def test_post_unsubscribe_marks_lead_and_blocklists(session, monkeypatch):
     session.add(LeadUnsubscribeToken(lead_id=lead.id, campaign_id=camp.id, token="tok-post"))
     await session.flush()
 
-    resp = await unsubscribe_one_click(token="tok-post", db=session)
+    resp = await unsubscribe_one_click(token="tok-post", request=_Req(), db=session)
     assert resp.status_code == 200
     # Idempotent: second POST is fine and creates no duplicate.
-    resp2 = await unsubscribe_one_click(token="tok-post", db=session)
+    resp2 = await unsubscribe_one_click(token="tok-post", request=_Req(), db=session)
     assert resp2.status_code == 200
 
     cl_row = (await session.execute(select(CampaignLead).where(CampaignLead.id == cl.id))).scalar_one()
@@ -309,5 +314,5 @@ async def test_post_unsubscribe_marks_lead_and_blocklists(session, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_post_unsubscribe_unknown_token_404(session):
-    resp = await unsubscribe_one_click(token="nope", db=session)
+    resp = await unsubscribe_one_click(token="nope", request=_Req(), db=session)
     assert resp.status_code == 404
