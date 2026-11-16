@@ -15,10 +15,10 @@ from sqlalchemy import select, func
 from app.models import (
     EmailLog, EmailOpen, EmailClick,
     TrackedLink, Lead, Campaign, CampaignLead, CampaignInbox,
-    Inbox, QueueSlot, LeadUnsubscribeToken,
+    Inbox, QueueSlot, LeadUnsubscribeToken, UnsubscribeEvent,
 )
 from app.routers.tracking import (
-    open_pixel, click_redirect, unsubscribe, caddy_ask, tracking_probe,
+    open_pixel, click_redirect, unsubscribe, unsubscribe_one_click, caddy_ask, tracking_probe,
 )
 from tests.conftest import (
     make_inbox, make_campaign, make_sequence, make_lead,
@@ -35,6 +35,9 @@ def _req(
     x_forwarded_for: str | None = None,
     cf_connecting_ip: str | None = None,
     client_host: str | None = None,
+    user_agent: str | None = None,
+    accept: str | None = None,
+    body: bytes | None = None,
 ):
     """Build a minimal fake Starlette Request-like object for the router functions."""
     raw_headers: dict[str, str] = {}
@@ -53,8 +56,18 @@ def _req(
                     return v
             return default
 
+    if user_agent:
+        raw_headers["User-Agent"] = user_agent
+    if accept:
+        raw_headers["Accept"] = accept
+
     client = SimpleNamespace(host=client_host) if client_host else None
-    return SimpleNamespace(headers=_FakeHeaders(), client=client)
+    ns = SimpleNamespace(headers=_FakeHeaders(), client=client)
+    if body is not None:
+        async def _body():
+            return body
+        ns.body = _body
+    return ns
 
 
 async def _noop_webhook(*args, **kwargs):
@@ -362,35 +375,32 @@ async def _setup_unsubscribe(session):
     return lead, campaign, cl, token_str
 
 
+async def _events(session):
+    return (await session.execute(select(UnsubscribeEvent).order_by(UnsubscribeEvent.id))).scalars().all()
+
+
+def _post(token_str, session, **kw):
+    return unsubscribe_one_click(token=token_str, request=_req(**kw), db=session)
+
+
 @pytest.mark.asyncio
-async def test_unsubscribe_invalid_token_returns_404(session, monkeypatch):
+async def test_unsubscribe_get_invalid_token_returns_404(session, monkeypatch):
     monkeypatch.setattr("app.tracking_events.fire_webhook_event", _noop_webhook)
-
-    resp = await unsubscribe(token="no-such-token", db=session)
-
+    resp = await unsubscribe(token="no-such-token", request=_req(), db=session)
     assert resp.status_code == 404
 
 
 @pytest.mark.asyncio
-async def test_unsubscribe_marks_enrollment_unsubscribed(session, monkeypatch):
+async def test_unsubscribe_post_invalid_token_returns_404(session, monkeypatch):
     monkeypatch.setattr("app.tracking_events.fire_webhook_event", _noop_webhook)
-
-    lead, campaign, cl, token_str = await _setup_unsubscribe(session)
-    assert cl.enrollment_status != "unsubscribed"
-
-    await unsubscribe(token=token_str, db=session)
-
-    await session.refresh(cl)
-    assert cl.enrollment_status == "unsubscribed"
+    assert (await _post("no-such-token", session)).status_code == 404
+    assert (await _post("no-such-token", session, accept="text/html")).status_code == 404
 
 
 @pytest.mark.asyncio
-async def test_unsubscribe_deletes_queue_slots(session, monkeypatch):
+async def test_unsubscribe_get_shows_form_and_changes_nothing(session, monkeypatch):
     monkeypatch.setattr("app.tracking_events.fire_webhook_event", _noop_webhook)
-
     lead, campaign, cl, token_str = await _setup_unsubscribe(session)
-
-    # add a pending slot
     slot = QueueSlot(
         campaign_lead_id=cl.id,
         inbox_id=(await make_inbox(session, email="slot@test.com")).id,
@@ -401,72 +411,137 @@ async def test_unsubscribe_deletes_queue_slots(session, monkeypatch):
     session.add(slot)
     await session.flush()
 
-    await unsubscribe(token=token_str, db=session)
-
-    result = await session.execute(
-        select(func.count(QueueSlot.id)).where(QueueSlot.campaign_lead_id == cl.id)
+    resp = await unsubscribe(
+        token=token_str, request=_req(x_real_ip="203.0.113.5", user_agent="Scanner/1"), db=session
     )
-    assert result.scalar() == 0
-
-
-@pytest.mark.asyncio
-async def test_unsubscribe_returns_html_page(session, monkeypatch):
-    monkeypatch.setattr("app.tracking_events.fire_webhook_event", _noop_webhook)
-
-    _, _, _, token_str = await _setup_unsubscribe(session)
-
-    resp = await unsubscribe(token=token_str, db=session)
 
     assert resp.status_code == 200
     assert "text/html" in resp.media_type
-    assert b"unsubscribed" in resp.body.lower()
+    body = resp.body.decode()
+    assert f'<form method="post" action="/u/{token_str}">' in body
+    assert "Abmeldung bestätigen" in body
+    assert resp.headers["cache-control"] == "no-store"
+    assert resp.headers["x-robots-tag"] == "noindex"
+
+    await session.refresh(cl)
+    assert cl.enrollment_status != "unsubscribed"
+    n = (await session.execute(
+        select(func.count(QueueSlot.id)).where(QueueSlot.campaign_lead_id == cl.id)
+    )).scalar()
+    assert n == 1
+    ev = await _events(session)
+    assert len(ev) == 1
+    assert (ev[0].action, ev[0].method, ev[0].ip, ev[0].user_agent) == (
+        "view", "GET", "203.0.113.5", "Scanner/1")
 
 
 @pytest.mark.asyncio
-async def test_unsubscribe_already_unsubscribed_shows_different_page(session, monkeypatch):
+async def test_unsubscribe_get_already_unsubscribed_shows_no_form(session, monkeypatch):
     monkeypatch.setattr("app.tracking_events.fire_webhook_event", _noop_webhook)
-
     lead, campaign, cl, token_str = await _setup_unsubscribe(session)
     cl.enrollment_status = "unsubscribed"
     await session.flush()
 
-    resp = await unsubscribe(token=token_str, db=session)
+    resp = await unsubscribe(token=token_str, request=_req(), db=session)
 
     assert resp.status_code == 200
-    assert b"already unsubscribed" in resp.body.lower()
+    assert b"bereits abgemeldet" in resp.body.lower()
+    assert b"<form" not in resp.body
 
 
 @pytest.mark.asyncio
-async def test_unsubscribe_fires_webhooks(session, monkeypatch):
+async def test_unsubscribe_post_form_unsubscribes_and_logs(session, monkeypatch):
+    monkeypatch.setattr("app.tracking_events.fire_webhook_event", _noop_webhook)
+    lead, campaign, cl, token_str = await _setup_unsubscribe(session)
+    slot = QueueSlot(
+        campaign_lead_id=cl.id,
+        inbox_id=(await make_inbox(session, email="slot@test.com")).id,
+        sequence_index=0,
+        scheduled_date=datetime(2026, 4, 1, 9, 0),
+        position_in_day=1,
+    )
+    session.add(slot)
+    await session.flush()
+
+    resp = await _post(token_str, session, x_real_ip="198.51.100.7", user_agent="Mozilla/5.0",
+                       accept="text/html,application/xhtml+xml", body=b"confirm=1")
+
+    assert resp.status_code == 200
+    assert "text/html" in resp.media_type
+    assert "abgemeldet" in resp.body.decode().lower()
+    await session.refresh(cl)
+    assert cl.enrollment_status == "unsubscribed"
+    n = (await session.execute(
+        select(func.count(QueueSlot.id)).where(QueueSlot.campaign_lead_id == cl.id)
+    )).scalar()
+    assert n == 0
+    ev = await _events(session)
+    assert len(ev) == 1
+    assert (ev[0].action, ev[0].method, ev[0].ip, ev[0].user_agent, ev[0].one_click) == (
+        "unsubscribed", "POST", "198.51.100.7", "Mozilla/5.0", False)
+    assert ev[0].lead_id == lead.id and ev[0].campaign_id == campaign.id
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_post_one_click_returns_plain_text(session, monkeypatch):
+    monkeypatch.setattr("app.tracking_events.fire_webhook_event", _noop_webhook)
+    lead, campaign, cl, token_str = await _setup_unsubscribe(session)
+
+    resp = await _post(token_str, session, body=b"List-Unsubscribe=One-Click")
+
+    assert resp.status_code == 200
+    assert resp.body == b"unsubscribed"
+    await session.refresh(cl)
+    assert cl.enrollment_status == "unsubscribed"
+    assert (await _events(session))[0].one_click is True
+
+    # empty body is also accepted
+    resp2 = await _post(token_str, session)
+    assert resp2.status_code == 200 and resp2.body == b"unsubscribed"
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_post_twice_is_idempotent(session, monkeypatch):
+    monkeypatch.setattr("app.tracking_events.fire_webhook_event", _noop_webhook)
+    lead, campaign, cl, token_str = await _setup_unsubscribe(session)
+
+    await _post(token_str, session, body=b"List-Unsubscribe=One-Click")
+    resp = await _post(token_str, session, accept="text/html", body=b"confirm=1")
+
+    assert resp.status_code == 200
+    assert b"bereits abgemeldet" in resp.body.lower()
+    assert [e.action for e in await _events(session)] == ["unsubscribed", "already"]
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_post_fires_webhooks(session, monkeypatch):
     events: list[str] = []
 
     async def capture(db, event_type, data):
         events.append(event_type)
 
     monkeypatch.setattr("app.tracking_events.fire_webhook_event", capture)
-
     _, _, _, token_str = await _setup_unsubscribe(session)
 
-    await unsubscribe(token=token_str, db=session)
+    await _post(token_str, session)
 
     assert "lead.unsubscribed" in events
     assert "lead.status_changed" in events
 
 
 @pytest.mark.asyncio
-async def test_unsubscribe_already_done_does_not_fire_webhooks(session, monkeypatch):
+async def test_unsubscribe_post_already_done_does_not_fire_webhooks(session, monkeypatch):
     events: list[str] = []
 
     async def capture(db, event_type, data):
         events.append(event_type)
 
     monkeypatch.setattr("app.tracking_events.fire_webhook_event", capture)
-
     lead, _, cl, token_str = await _setup_unsubscribe(session)
     cl.enrollment_status = "unsubscribed"
     await session.flush()
 
-    await unsubscribe(token=token_str, db=session)
+    await _post(token_str, session)
 
     assert "lead.unsubscribed" not in events
 

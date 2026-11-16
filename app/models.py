@@ -1069,6 +1069,21 @@ class BounceEvent(Base):
     created_at = Column(DateTime, default=_utcnow, nullable=False)
 
 
+class UnsubscribeEvent(Base):
+    """Audit log of /u/{token} requests: page views and unsubscribe attempts."""
+    __tablename__ = "unsubscribe_event"
+    id = Column(Integer, primary_key=True, index=True)
+    token_id = Column(Integer, nullable=True)
+    lead_id = Column(Integer, nullable=True, index=True)
+    campaign_id = Column(Integer, nullable=True, index=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    method = Column(String(8), nullable=False)
+    action = Column(String(16), nullable=False)  # view | unsubscribed | already
+    ip = Column(String(64), nullable=True)
+    user_agent = Column(String(512), nullable=True)
+    one_click = Column(Boolean, nullable=False, default=False)
+
+
 class CampaignStartLog(Base):
     """Audit trail for every start/resume attempt made through MCP (approved or rejected)."""
     __tablename__ = "campaign_start_log"

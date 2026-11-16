@@ -4,6 +4,7 @@ Routes
 ------
 GET /o/{log_id}        — open tracking pixel (1×1 transparent GIF)
 GET /c/{token}         — click-tracking redirect to original URL
+GET/POST /u/{token}    — unsubscribe confirmation page / unsubscribe (RFC 8058)
 GET /api/caddy/ask     — Caddy on_demand_tls domain approval gate
 
 These routes work on any hostname (the app's own domain *or* a custom
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+from urllib.parse import parse_qs
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import PlainTextResponse, Response, RedirectResponse
@@ -32,6 +34,11 @@ from app.tracking_events import (
     record_email_click,
     record_email_open,
     process_unsubscribe,
+    peek_unsubscribe,
+    log_unsubscribe_view,
+    unsubscribe_confirm_html,
+    INVALID_UNSUBSCRIBE_DE_HTML,
+    ALREADY_UNSUBSCRIBED_DE_HTML,
     resolve_click_redirect_url,
 )
 from app.client_ip import client_ip_from_request
@@ -77,42 +84,70 @@ async def click_redirect(
     return RedirectResponse(url=dest, status_code=302)
 
 
+_NO_CACHE = {"Cache-Control": "no-store", "X-Robots-Tag": "noindex"}
+
+
 @router.get("/u/{token}", include_in_schema=False)
 async def unsubscribe(
     token: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """Process an unsubscribe request.
+    """Show the unsubscribe confirmation page. Never changes state.
 
-    Works both as a one-click server-side action (no browser needed – the
-    email client just fires a POST/GET) and as a human-readable page when
-    opened in a browser.  The token encodes the (lead, campaign) pair so we
-    know exactly which campaign to stop.
-
-    Actions:
-      1. Mark this lead's **enrollment** in that campaign as ``unsubscribed``.
-      2. Delete remaining ``QueueSlot`` rows for this lead+campaign so no
-         further emails are dispatched.
+    Link scanners (Defender Safe Links, Sophos, ...) prefetch this URL, so the
+    actual unsubscribe happens only on POST (form submit or RFC 8058 one-click).
     """
-    html, status = await process_unsubscribe(db, token)
-    return Response(content=html, media_type="text/html", status_code=status)
+    row, already = await peek_unsubscribe(db, token)
+    if row is None:
+        return Response(content=INVALID_UNSUBSCRIBE_DE_HTML, media_type="text/html",
+                        status_code=404, headers=_NO_CACHE)
+    await log_unsubscribe_view(
+        db, row, ip=client_ip_from_request(request),
+        user_agent=request.headers.get("user-agent"),
+    )
+    html = ALREADY_UNSUBSCRIBED_DE_HTML if already else unsubscribe_confirm_html(token)
+    return Response(content=html, media_type="text/html", status_code=200, headers=_NO_CACHE)
+
+
+async def _read_form(request: Request) -> dict[str, str]:
+    reader = getattr(request, "body", None)
+    if reader is None:
+        return {}
+    try:
+        raw = await reader()
+    except Exception:
+        return {}
+    return {k: v[0] for k, v in parse_qs(raw.decode("utf-8", "ignore")).items()}
 
 
 @router.post("/u/{token}", include_in_schema=False)
 async def unsubscribe_one_click(
     token: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """RFC 8058 one-click unsubscribe (``List-Unsubscribe-Post``).
+    """Perform the unsubscribe (idempotent).
 
-    Mailbox providers POST ``List-Unsubscribe=One-Click`` here. No auth, no
-    confirmation page, idempotent: same effect as the GET link (enrollment
-    unsubscribed, queue cleared, lead status + blocklist).
+    Serves both the confirmation form and RFC 8058 one-click
+    (``List-Unsubscribe=One-Click``, form-encoded or empty body).
+    Browsers (Accept: text/html or field ``confirm``) get the German HTML page,
+    mail providers get plain text ``unsubscribed``.
     """
-    _html, status = await process_unsubscribe(db, token)
+    form = await _read_form(request)
+    accept = request.headers.get("accept") or ""
+    browser = "text/html" in accept.lower() or "confirm" in form
+    one_click = form.get("List-Unsubscribe") == "One-Click"
+    html, status = await process_unsubscribe(
+        db, token, method="POST", ip=client_ip_from_request(request),
+        user_agent=request.headers.get("user-agent"), one_click=one_click,
+        german=browser,
+    )
+    if browser:
+        return Response(content=html, media_type="text/html", status_code=status, headers=_NO_CACHE)
     if status != 200:
-        return PlainTextResponse("not found", status_code=status)
-    return PlainTextResponse("unsubscribed", status_code=200)
+        return PlainTextResponse("not found", status_code=status, headers=_NO_CACHE)
+    return PlainTextResponse("unsubscribed", status_code=200, headers=_NO_CACHE)
 
 
 @router.get("/api/caddy/ask", include_in_schema=False)
