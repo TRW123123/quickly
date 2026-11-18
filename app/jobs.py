@@ -927,19 +927,23 @@ async def run_send_job():
                                 _prev_plain, _from_name, _from_email, prev_sent_at
                             )
 
-                # ── Mandatory footer: imprint + unsubscribe link ─────────────
+                # ── Mandatory imprint; unsubscribe link only if the campaign wants it ──
+                _campaign_unsub = bool(campaign.add_unsubscribe_header)
                 send_body = apply_footer_to_body(
                     send_body,
                     is_html=is_html,
                     footer_text=footer_text,
                     unsub_url=unsub_url,
                     template_body=body,
+                    include_unsubscribe=_campaign_unsub,
                 )
 
-                # Unsubscribe header: always on for campaign mail (opt-out must
-                # be possible in every cold mail; campaign toggle is ignored).
-                list_unsub_url = unsub_url
-                list_unsub_one_click = True  # RFC 8058 one-click is mandatory
+                # List-Unsubscribe headers only when the campaign enables them;
+                # One-Click (-Post) additionally needs add_one_click_unsubscribe.
+                list_unsub_url = unsub_url if _campaign_unsub else None
+                list_unsub_one_click = bool(
+                    _campaign_unsub and campaign.add_one_click_unsubscribe
+                )
 
                 # ── phase 3: send ────────────────────────────────────────────
                 # Commit before the network call.  The pre-created EmailLog row
@@ -1784,18 +1788,23 @@ async def send_slot_job(slot_id: int) -> None:
                 if _prev_plain:
                     send_body = send_body + build_quote_plain(_prev_plain, _from_name, _from_email, prev_sent_at)
 
-        # ── Mandatory footer: imprint + unsubscribe link ──────────────────
+        # ── Mandatory imprint; unsubscribe link only if the campaign wants it ──
+        _campaign_unsub = bool(campaign.add_unsubscribe_header)
         send_body = apply_footer_to_body(
             send_body,
             is_html=is_html,
             footer_text=footer_text,
             unsub_url=unsub_url,
             template_body=body,
+            include_unsubscribe=_campaign_unsub,
         )
 
-        # List-Unsubscribe is always set for campaign mail (campaign toggle ignored).
-        list_unsub_url = unsub_url
-        list_unsub_one_click = True  # RFC 8058 one-click is mandatory
+        # List-Unsubscribe headers only when the campaign enables them;
+        # One-Click (-Post) additionally needs add_one_click_unsubscribe.
+        list_unsub_url = unsub_url if _campaign_unsub else None
+        list_unsub_one_click = bool(
+            _campaign_unsub and campaign.add_one_click_unsubscribe
+        )
 
         # ── Send ──────────────────────────────────────────────────────────
         # Commit before the network call.  The pre-created EmailLog row and

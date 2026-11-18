@@ -146,15 +146,19 @@ def apply_footer_to_body(
     footer_text: str,
     unsub_url: str,
     template_body: str | None = None,
+    include_unsubscribe: bool = True,
 ) -> str:
     """Append the footer; skip the extra unsubscribe link if the mail has one.
 
     *template_body* is the rendered template content (before tracking / quoted
     history); when given, it decides whether the author already placed
     ``{{unsubscribe_link}}`` in the mail.
+
+    With ``include_unsubscribe=False`` (campaign.add_unsubscribe_header off)
+    only the imprint is appended, never the unsubscribe line.
     """
     probe = body if template_body is None else template_body
-    include_unsub = not body_contains_unsubscribe(probe, unsub_url)
+    include_unsub = include_unsubscribe and not body_contains_unsubscribe(probe, unsub_url)
     return append_compliance_footer(
         body,
         is_html=is_html,

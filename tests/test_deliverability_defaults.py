@@ -246,7 +246,7 @@ async def test_send_html_step_goes_out_as_plain_text_without_tracking(session, s
     assert "Termin (https://cal.example/me)" in call["body"]
     unsub = call["list_unsubscribe_url"]
     assert call["body"].rstrip().endswith(unsub)  # plain-text footer with unsubscribe URL
-    assert call["list_unsubscribe_one_click"] is True  # RFC 8058 always on
+    assert call["list_unsubscribe_one_click"] is False  # campaign toggle off -> no -Post
 
 
 # ── 4. RFC 8058 headers ─────────────────────────────────────────────────────

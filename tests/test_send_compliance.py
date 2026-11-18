@@ -100,7 +100,7 @@ async def _slot_count(session, inbox_id):
 @pytest.mark.asyncio
 async def test_text_mail_gets_imprint_and_unsubscribe_footer(session, sent):
     inbox, campaign, lead, cl, slot = await _setup(
-        session, campaign_kwargs={"add_unsubscribe_header": False}
+        session, campaign_kwargs={"add_unsubscribe_header": True}
     )
     await jobs_mod.send_slot_job(slot.id)
 
@@ -109,9 +109,46 @@ async def test_text_mail_gets_imprint_and_unsubscribe_footer(session, sent):
     assert call["body"].startswith("Hallo Test Lead")
     assert "Teststr. 1, 12345 Teststadt" in call["body"]
     unsub = call["list_unsubscribe_url"]
-    # Header is forced on even though the campaign toggle is off.
     assert unsub and "/u/" in unsub
+    assert call["list_unsubscribe_one_click"] is True
+    assert "Keine weiteren E-Mails erhalten" in call["body"]
     assert call["body"].rstrip().endswith(unsub)
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_disabled_gets_imprint_only(session, sent):
+    _, _, _, _, slot = await _setup(
+        session,
+        campaign_kwargs={"add_unsubscribe_header": False, "add_one_click_unsubscribe": False},
+    )
+    await jobs_mod.send_slot_job(slot.id)
+
+    assert len(sent) == 1
+    call = sent[0]
+    assert "Teststr. 1, 12345 Teststadt" in call["body"]
+    assert "Keine weiteren E-Mails erhalten" not in call["body"]
+    assert "/u/" not in call["body"]
+    assert not call["list_unsubscribe_url"]
+    assert not call["list_unsubscribe_one_click"]
+
+
+@pytest.mark.asyncio
+async def test_one_click_off_keeps_header_without_post(session, sent):
+    _, _, _, _, slot = await _setup(
+        session,
+        campaign_kwargs={"add_unsubscribe_header": True, "add_one_click_unsubscribe": False},
+    )
+    await jobs_mod.send_slot_job(slot.id)
+    assert sent[0]["list_unsubscribe_url"]
+    assert not sent[0]["list_unsubscribe_one_click"]
+
+
+def test_apply_footer_without_unsubscribe():
+    out = sc.apply_footer_to_body(
+        "Hi", is_html=False, footer_text="A GmbH", unsub_url="https://x.test/u/t",
+        include_unsubscribe=False,
+    )
+    assert "A GmbH" in out and "x.test" not in out and "Keine weiteren" not in out
 
 
 @pytest.mark.asyncio
