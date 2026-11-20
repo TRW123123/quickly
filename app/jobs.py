@@ -206,6 +206,64 @@ async def _update_enrollment_after_send(session: AsyncSession, cl: CampaignLead,
     if n_seq > 0 and sequence.position >= n_seq - 1:
         cl.enrollment_status = "completed"
 
+
+async def _step_already_logged(
+    session: AsyncSession, campaign_id: int, lead_id: int, sequence_index: int
+) -> bool:
+    """True when an EmailLog row already exists for this sequence step.
+
+    The pre-created EmailLog row is committed *before* the network send, so it
+    doubles as the "this step is taken" marker: a step with a log row is either
+    sent or currently being sent and must never be sent again.
+    """
+    res = await session.execute(
+        select(EmailLog.id)
+        .where(
+            EmailLog.campaign_id == campaign_id,
+            EmailLog.lead_id == lead_id,
+            EmailLog.sequence_index == sequence_index,
+        )
+        .limit(1)
+    )
+    return res.scalar_one_or_none() is not None
+
+
+async def _drop_slot_for_logged_step(
+    session: AsyncSession, slot_id: int, campaign_id: int, lead_id: int, sequence_index: int
+) -> None:
+    from sqlalchemy import delete as _sql_delete
+
+    log.warning(
+        "send_slot_job: step already logged (campaign=%s lead=%s sequence_index=%s) – "
+        "NOT sending again, dropping stale slot %s",
+        campaign_id, lead_id, sequence_index, slot_id,
+    )
+    await session.execute(_sql_delete(QueueSlot).where(QueueSlot.id == slot_id))
+    await session.commit()
+
+
+def _slot_snapshot(slot: QueueSlot) -> dict:
+    return {
+        "campaign_lead_id": slot.campaign_lead_id,
+        "inbox_id": slot.inbox_id,
+        "sequence_index": slot.sequence_index,
+        "scheduled_date": slot.scheduled_date,
+        "position_in_day": slot.position_in_day,
+        "variant_id": slot.variant_id,
+    }
+
+
+async def _release_claimed_slot(session: AsyncSession, snapshot: dict) -> None:
+    """Put a claimed slot back after the send did NOT go out (retry later)."""
+    exists = await session.execute(
+        select(QueueSlot.id).where(
+            QueueSlot.campaign_lead_id == snapshot["campaign_lead_id"],
+            QueueSlot.sequence_index == snapshot["sequence_index"],
+        )
+    )
+    if exists.scalar_one_or_none() is None:
+        session.add(QueueSlot(**snapshot))
+
 # Updated each time run_send_job finishes (for /api/status)
 last_send_job_run: datetime | None = None
 last_send_job_sent_count: int = 0
@@ -845,6 +903,17 @@ async def run_send_job():
                 # Render lead variables in the sender name too (e.g. "Jane at Acme")
                 from_name = render_body(inbox.display_name or "", lead_data, context=render_ctx)
 
+                # ── Dedupe: never send a step that is already in email_log ──
+                if await _step_already_logged(session, campaign.id, lead.id, slot.sequence_index):
+                    log.warning(
+                        "Send job: step already logged (campaign=%s lead=%s sequence_index=%s) "
+                        "– NOT sending again, dropping stale slot %s",
+                        campaign.id, lead.id, slot.sequence_index, slot.id,
+                    )
+                    await session.delete(slot)
+                    await session.commit()
+                    continue
+
                 # ── phase 1: pre-create EmailLog to get an ID for tracking ──
                 email_log_entry = EmailLog(
                     lead_id=lead.id,
@@ -1276,6 +1345,13 @@ async def send_slot_job(slot_id: int) -> None:
             return
 
         slot, cl, campaign, lead, sequence, inbox = row
+
+        # ── Dedupe: never send a step that is already in email_log ───────
+        if await _step_already_logged(session, campaign.id, lead.id, slot.sequence_index):
+            await _drop_slot_for_logged_step(
+                session, slot_id, campaign.id, lead.id, slot.sequence_index
+            )
+            return
 
         # ── Pre-flight checks ────────────────────────────────────────────
         if inbox.paused:
@@ -1717,12 +1793,41 @@ async def send_slot_job(slot_id: int) -> None:
         # Render lead variables in the sender name too (e.g. "Jane at Acme")
         from_name = render_body(inbox.display_name or "", lead_data, context=render_ctx)
 
+        # ── Claim the slot (atomic, committed BEFORE the network send) ────
+        # The slot row is deleted in the same transaction that inserts the
+        # pre-created EmailLog.  Only one worker can delete the row (on
+        # Postgres the DELETE takes the row lock; the loser sees rowcount 0),
+        # and once this commits the step is "taken": nothing that happens
+        # after the SMTP call (DB error, crash, rollback) can bring the slot
+        # back and trigger a second send.  If the send itself fails the claim
+        # is released explicitly (_release_claimed_slot).
+        from sqlalchemy import delete as _sql_delete_claim
+
+        if await _step_already_logged(session, campaign.id, lead.id, slot.sequence_index):
+            await _drop_slot_for_logged_step(
+                session, slot_id, campaign.id, lead.id, slot.sequence_index
+            )
+            return
+        slot_snapshot = _slot_snapshot(slot)
+        seq_index = slot_snapshot["sequence_index"]
+        session.expunge(slot)
+        claim = await session.execute(
+            _sql_delete_claim(QueueSlot).where(QueueSlot.id == slot_id)
+        )
+        if claim.rowcount != 1:
+            log.warning(
+                "send_slot_job: slot %d already claimed/removed by another worker – not sending",
+                slot_id,
+            )
+            await session.rollback()
+            return
+
         # ── Pre-create EmailLog to get an ID for tracking ─────────────────
         email_log_entry = EmailLog(
             lead_id=lead.id,
             campaign_id=campaign.id,
             inbox_id=inbox.id,
-            sequence_index=slot.sequence_index,
+            sequence_index=seq_index,
             variant_id=chosen_variant_id,
             subject=subject,
             body=logged_body,
@@ -1773,7 +1878,9 @@ async def send_slot_job(slot_id: int) -> None:
                     "Beacon register failed for email_log_id=%s; aborting send",
                     email_log_entry.id,
                 )
-                await session.delete(email_log_entry)
+                # Nothing committed yet: rolling back drops the pre-created
+                # log AND undoes the slot claim, so the slot stays queued.
+                await session.rollback()
                 return
 
         # ── Append quoted previous email ──────────────────────────────────
@@ -1861,6 +1968,7 @@ async def send_slot_job(slot_id: int) -> None:
                     slot_id, lead.id,
                 )
                 await session.delete(email_log_entry)
+                await _release_claimed_slot(session, slot_snapshot)
                 await session.commit()
                 raise
 
@@ -1871,6 +1979,9 @@ async def send_slot_job(slot_id: int) -> None:
                 lead.id, inbox.email, result.error_type, result.message,
             )
             await session.delete(email_log_entry)
+            if result.error_type not in ("bounce", "invalid_recipient"):
+                # Not sent: give the claimed slot back (bounces drop all slots).
+                await _release_claimed_slot(session, slot_snapshot)
             if result.error_type in ("bounce", "invalid_recipient"):
                 # Hard → blocklist now; soft → count, 3rd → blocklist
                 from app.bounces import record_send_rejection
@@ -1912,6 +2023,7 @@ async def send_slot_job(slot_id: int) -> None:
         if not result:
             # Transient failure – roll back the pre-created log; slot stays for retry
             await session.delete(email_log_entry)
+            await _release_claimed_slot(session, slot_snapshot)
             await _alert_repeated_send_failure(
                 session, inbox, getattr(smtp_account, "last_send_error", "") or ""
             )
@@ -1920,125 +2032,158 @@ async def send_slot_job(slot_id: int) -> None:
             return
 
         # ── Success ───────────────────────────────────────────────────────
+        # The mail is out.  Persist the send record and the enrollment update
+        # in their OWN commit before any side effect (unibox mirror, webhooks,
+        # notifications) runs: an error there must never undo this.  The slot
+        # was already removed by the claim above.
         email_log_entry.message_id = result.message_id
         email_log_entry.thread_id = result.thread_id or prev_thread_id
-        await session.delete(slot)
-        await _update_enrollment_after_send(session, cl, campaign, sequence)
+        try:
+            await _update_enrollment_after_send(session, cl, campaign, sequence)
+            await session.commit()
+        except Exception:
+            log.exception(
+                "send_slot_job: slot %d SENT (message_id=%s) but recording the send "
+                "failed; email_log id=%s keeps the step claimed (message_id may be empty)",
+                slot_id, result.message_id, email_log_entry.id,
+            )
+            await session.rollback()
+            last_send_job_run = time_provider.now()
+            last_send_job_sent_count += 1
+            return
 
-        if inbox.provider not in ("office365", "smtp") and email_log_entry.thread_id:
-            try:
-                from app.unibox import upsert_sent_message as _upsert_sent_gmail
-                await _upsert_sent_gmail(
-                    session,
-                    inbox_id=inbox.id,
-                    thread_id=email_log_entry.thread_id,
-                    gmail_message_id=result.gmail_message_id,
-                    rfc_message_id=result.message_id,
-                    subject=subject,
-                    to_email=lead.email,
-                    from_email=inbox.email,
-                    body=send_body,
-                    is_html=is_html,
-                )
-            except Exception:
-                log.exception(
-                    "send_slot_job: failed to upsert sent Gmail message "
-                    "inbox_id=%s lead=%s", inbox.id, lead.email,
-                )
+        try:
+            await _after_send_side_effects(
+                session, inbox=inbox, lead=lead, campaign=campaign,
+                email_log_entry=email_log_entry, result=result, subject=subject,
+                send_body=send_body, is_html=is_html, sequence_index=seq_index,
+            )
+            await session.commit()
+        except Exception:
+            log.exception(
+                "send_slot_job: post-send side effects failed for slot %d "
+                "(email already sent and recorded, NOT retrying)", slot_id,
+            )
+            await session.rollback()
 
-        if inbox.provider == "office365" and email_log_entry.thread_id:
-            try:
-                from app.unibox import upsert_sent_o365_message
-                await upsert_sent_o365_message(
-                    session,
-                    inbox_id=inbox.id,
-                    conversation_id=email_log_entry.thread_id,
-                    internet_message_id=result.message_id,
-                    subject=subject,
-                    to_email=lead.email,
-                    from_email=inbox.email,
-                    body=send_body,
-                    is_html=is_html,
-                )
-            except Exception:
-                log.exception(
-                    "send_slot_job: failed to upsert sent O365 message "
-                    "inbox_id=%s lead=%s", inbox.id, lead.email,
-                )
+        last_send_job_run = time_provider.now()
+        last_send_job_sent_count += 1
+        log.info("send_slot_job: slot %d sent successfully", slot_id)
 
-        if inbox.provider == "smtp" and email_log_entry.thread_id:
-            try:
-                from app.unibox import upsert_sent_smtp_message
-                await upsert_sent_smtp_message(
-                    session,
-                    inbox_id=inbox.id,
-                    thread_key=email_log_entry.thread_id,
-                    internet_message_id=result.message_id,
-                    subject=subject,
-                    to_email=lead.email,
-                    from_email=inbox.email,
-                    body=send_body,
-                    is_html=is_html,
-                )
-            except Exception:
-                log.exception(
-                    "send_slot_job: failed to upsert sent SMTP message "
-                    "inbox_id=%s lead=%s", inbox.id, lead.email,
-                )
 
-        await fire_webhook_event(session, "email.sent", {
-            "email_log_id": email_log_entry.id,
-            "lead_id": lead.id, "lead_email": lead.email,
-            "campaign_id": campaign.id, "inbox_id": inbox.id, "inbox_email": inbox.email,
-            "subject": subject, "sequence_index": slot.sequence_index,
-            "message_id": result.message_id, "thread_id": result.thread_id,
-            "timestamp": time_provider.utcnow().isoformat() + "Z",
-        })
+async def _after_send_side_effects(
+    session: AsyncSession, *, inbox, lead, campaign, email_log_entry, result,
+    subject: str, send_body: str, is_html: bool, sequence_index: int,
+) -> None:
+    """Unibox mirror, webhooks and test-mode engagement after a recorded send."""
+    if inbox.provider not in ("office365", "smtp") and email_log_entry.thread_id:
+        try:
+            from app.unibox import upsert_sent_message as _upsert_sent_gmail
+            await _upsert_sent_gmail(
+                session,
+                inbox_id=inbox.id,
+                thread_id=email_log_entry.thread_id,
+                gmail_message_id=result.gmail_message_id,
+                rfc_message_id=result.message_id,
+                subject=subject,
+                to_email=lead.email,
+                from_email=inbox.email,
+                body=send_body,
+                is_html=is_html,
+            )
+        except Exception:
+            log.exception(
+                "send_slot_job: failed to upsert sent Gmail message "
+                "inbox_id=%s lead=%s", inbox.id, lead.email,
+            )
 
-        # ── Test mode: simulate engagement events ─────────────────────────
-        if settings.test_mode:
-            from app.models import EmailOpen, EmailClick, TrackedLink as _TL
-            fake_ip = f"10.0.{random.randint(0, 255)}.{random.randint(1, 254)}"
-            if random.random() < 0.4:
-                email_log_entry.opened = True
-                session.add(EmailOpen(email_log_id=email_log_entry.id, ip_address=fake_ip))
-                await fire_webhook_event(session, "email.opened", {
+    if inbox.provider == "office365" and email_log_entry.thread_id:
+        try:
+            from app.unibox import upsert_sent_o365_message
+            await upsert_sent_o365_message(
+                session,
+                inbox_id=inbox.id,
+                conversation_id=email_log_entry.thread_id,
+                internet_message_id=result.message_id,
+                subject=subject,
+                to_email=lead.email,
+                from_email=inbox.email,
+                body=send_body,
+                is_html=is_html,
+            )
+        except Exception:
+            log.exception(
+                "send_slot_job: failed to upsert sent O365 message "
+                "inbox_id=%s lead=%s", inbox.id, lead.email,
+            )
+
+    if inbox.provider == "smtp" and email_log_entry.thread_id:
+        try:
+            from app.unibox import upsert_sent_smtp_message
+            await upsert_sent_smtp_message(
+                session,
+                inbox_id=inbox.id,
+                thread_key=email_log_entry.thread_id,
+                internet_message_id=result.message_id,
+                subject=subject,
+                to_email=lead.email,
+                from_email=inbox.email,
+                body=send_body,
+                is_html=is_html,
+            )
+        except Exception:
+            log.exception(
+                "send_slot_job: failed to upsert sent SMTP message "
+                "inbox_id=%s lead=%s", inbox.id, lead.email,
+            )
+
+    await fire_webhook_event(session, "email.sent", {
+        "email_log_id": email_log_entry.id,
+        "lead_id": lead.id, "lead_email": lead.email,
+        "campaign_id": campaign.id, "inbox_id": inbox.id, "inbox_email": inbox.email,
+        "subject": subject, "sequence_index": sequence_index,
+        "message_id": result.message_id, "thread_id": result.thread_id,
+        "timestamp": time_provider.utcnow().isoformat() + "Z",
+    })
+
+    # ── Test mode: simulate engagement events ─────────────────────────
+    if settings.test_mode:
+        from app.models import EmailOpen, EmailClick, TrackedLink as _TL
+        fake_ip = f"10.0.{random.randint(0, 255)}.{random.randint(1, 254)}"
+        if random.random() < 0.4:
+            email_log_entry.opened = True
+            session.add(EmailOpen(email_log_id=email_log_entry.id, ip_address=fake_ip))
+            await fire_webhook_event(session, "email.opened", {
+                "email_log_id": email_log_entry.id,
+                "lead_id": lead.id, "campaign_id": campaign.id,
+                "ip_address": fake_ip, "timestamp": time_provider.utcnow().isoformat() + "Z",
+            })
+            if random.random() < 0.5:
+                email_log_entry.clicked = True
+                session.add(EmailClick(
+                    email_log_id=email_log_entry.id, ip_address=fake_ip,
+                    clicked_at=time_provider.utcnow(),
+                ))
+                await fire_webhook_event(session, "email.clicked", {
                     "email_log_id": email_log_entry.id,
                     "lead_id": lead.id, "campaign_id": campaign.id,
+                    "original_url": "https://example.com/test-link",
                     "ip_address": fake_ip, "timestamp": time_provider.utcnow().isoformat() + "Z",
                 })
-                if random.random() < 0.5:
-                    email_log_entry.clicked = True
-                    session.add(EmailClick(
-                        email_log_id=email_log_entry.id, ip_address=fake_ip,
-                        clicked_at=time_provider.utcnow(),
-                    ))
-                    await fire_webhook_event(session, "email.clicked", {
-                        "email_log_id": email_log_entry.id,
-                        "lead_id": lead.id, "campaign_id": campaign.id,
-                        "original_url": "https://example.com/test-link",
-                        "ip_address": fake_ip, "timestamp": time_provider.utcnow().isoformat() + "Z",
-                    })
-            if random.random() < 0.15:
-                fake_reply = LeadReply(
-                    lead_id=lead.id, campaign_id=campaign.id,
-                    replied_at=time_provider.utcnow(),
-                )
-                session.add(fake_reply)
-                await session.flush()  # get the assigned id
-                await fire_webhook_event(session, "lead.replied", {
-                    "lead_id": lead.id, "lead_email": lead.email, "lead_name": lead.name or "",
-                    "thread_id": email_log_entry.thread_id or "fake-thread",
-                    "inbox_id": inbox.id, "inbox_email": inbox.email,
-                    "reply_id": fake_reply.id,
-                    "timestamp": time_provider.utcnow().isoformat() + "Z",
-                })
-
-        await session.commit()
-
-    last_send_job_run = time_provider.now()
-    last_send_job_sent_count += 1
-    log.info("send_slot_job: slot %d sent successfully", slot_id)
+        if random.random() < 0.15:
+            fake_reply = LeadReply(
+                lead_id=lead.id, campaign_id=campaign.id,
+                replied_at=time_provider.utcnow(),
+            )
+            session.add(fake_reply)
+            await session.flush()  # get the assigned id
+            await fire_webhook_event(session, "lead.replied", {
+                "lead_id": lead.id, "lead_email": lead.email, "lead_name": lead.name or "",
+                "thread_id": email_log_entry.thread_id or "fake-thread",
+                "inbox_id": inbox.id, "inbox_email": inbox.email,
+                "reply_id": fake_reply.id,
+                "timestamp": time_provider.utcnow().isoformat() + "Z",
+            })
 
 
 # ---------------------------------------------------------------------------
@@ -2059,8 +2204,10 @@ async def _dispatch_slot(slot_id: int, delay: float) -> None:
     except asyncio.CancelledError:
         raise
     except Exception:
-        # Never let a failed task take the scheduler down (or die silently):
-        # the slot stays queued and the next scan retries it.
+        # Never let a failed task take the scheduler down (or die silently).
+        # Errors before the claim leave the slot queued for the next scan;
+        # once the slot is claimed (just before the network send) a failure
+        # can no longer re-queue it, so a sent step is never sent twice.
         log.exception("send_slot_job: unhandled error for slot_id=%s", slot_id)
     finally:
         _pending_slot_ids.discard(slot_id)

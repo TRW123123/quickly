@@ -17,6 +17,54 @@ from app.models import Campaign, Sequence, CampaignLead, QueueSlot, Inbox, Email
 log = logging.getLogger("quickly.queue")
 
 
+async def delete_slots_for_logged_steps(session: AsyncSession, campaign_lead_ids: List[int]) -> int:
+    """Delete queue slots whose step already has an EmailLog row.
+
+    A step with an email_log row (campaign_id, lead_id, sequence_index) is sent
+    (or being sent right now – the send job commits that row before the
+    network call).  A slot for it is stale and would cause a duplicate send.
+    """
+    if not campaign_lead_ids:
+        return 0
+    logged = (
+        select(EmailLog.id)
+        .where(
+            EmailLog.campaign_id == CampaignLead.campaign_id,
+            EmailLog.lead_id == CampaignLead.lead_id,
+            EmailLog.sequence_index == QueueSlot.sequence_index,
+        )
+        .correlate(QueueSlot)
+    )
+    cl_has_log = (
+        select(CampaignLead.id)
+        .where(CampaignLead.id == QueueSlot.campaign_lead_id, logged.exists())
+        .correlate(QueueSlot)
+    )
+    res = await session.execute(
+        delete(QueueSlot)
+        .where(QueueSlot.campaign_lead_id.in_(campaign_lead_ids), cl_has_log.exists())
+        .execution_options(synchronize_session=False)
+    )
+    n = res.rowcount or 0
+    if n:
+        log.warning("delete_slots_for_logged_steps: removed %d stale slot(s) for already-sent steps", n)
+    return n
+
+
+async def _last_logged_step_by_lead(
+    session: AsyncSession, campaign_id: int, lead_ids: List[int]
+) -> dict:
+    """lead_id -> highest sequence_index already in email_log for *campaign_id*."""
+    if not lead_ids:
+        return {}
+    res = await session.execute(
+        select(EmailLog.lead_id, func.max(EmailLog.sequence_index))
+        .where(EmailLog.campaign_id == campaign_id, EmailLog.lead_id.in_(lead_ids))
+        .group_by(EmailLog.lead_id)
+    )
+    return {lead_id: mx for lead_id, mx in res.all() if mx is not None}
+
+
 def compute_effective_daily_limit(inbox, for_date: Optional[date] = None) -> int:
     """Return the effective daily send limit for an inbox on a given date.
 
@@ -1082,6 +1130,12 @@ async def reserve_slots_for_new_leads_bulk(
         asap_sequences_by_lead = await _get_asap_ready_sequences_for_leads(
             session, campaign_id, campaign_leads, sequences
         )
+    # Usually brand-new leads (nothing sent → -1), but a re-enrolled lead can
+    # already have logged steps; those must never be queued again.
+    already_logged = await _last_logged_step_by_lead(
+        session, campaign_id, [cl.lead_id for cl in campaign_leads]
+    )
+    await delete_slots_for_logged_steps(session, [cl.id for cl in campaign_leads])
     for cl in campaign_leads:
         effective_inboxes = _filter_inboxes_for_lead_provider(
             inboxes, lead_providers.get(cl.lead_id), match_provider
@@ -1091,7 +1145,7 @@ async def reserve_slots_for_new_leads_bulk(
             session, cl.id, campaign, effective_inboxes, lead_sequences,
             lead_id=cl.lead_id,
             start_date=base_start,
-            last_sent_sequence_index=-1,  # brand-new leads: schedule everything
+            last_sent_sequence_index=already_logged.get(cl.lead_id, -1),
             cache=slot_cache,
         )
 
@@ -1249,6 +1303,10 @@ async def _recalculate_queue_for_campaign_leads(
             )
         )
         total_deleted += del_result.rowcount
+
+    # Slots for steps that are already logged (sent / in flight) are stale –
+    # the "> last_sent" delete above keeps them, so drop them explicitly.
+    total_deleted += await delete_slots_for_logged_steps(session, [cl.id for cl in ordered_leads])
 
     await session.flush()  # Single flush for all deletes
     log.info("%s: bulk-deleted %d old slots across %d leads", log_prefix, total_deleted, len(ordered_leads))
@@ -1646,6 +1704,9 @@ async def recalculate_queue_round_robin(
             total_deleted += del_r.rowcount
 
     await session.flush()
+    total_deleted += await delete_slots_for_logged_steps(
+        session, [cl.id for cid in active_campaign_ids for cl in leads_by_campaign[cid]]
+    )
     log.info("recalculate_queue_round_robin: bulk-deleted %d old slots", total_deleted)
 
     # ===========================================================================

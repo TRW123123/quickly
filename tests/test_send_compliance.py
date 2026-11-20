@@ -205,7 +205,10 @@ async def test_fail_closed_without_imprint(session, sent, monkeypatch, caplog):
 @pytest.mark.asyncio
 async def test_minimum_gap_three_minutes_even_if_inbox_allows_less(session, sent):
     inbox, campaign, lead, cl, slot = await _setup(session, inbox_kwargs={"wait_minutes_between": 1})
-    await make_email_log(session, lead.id, campaign.id, inbox_id=inbox.id,
+    # Previous mail through the same inbox, but to another lead: a log for
+    # this lead's step 0 would (correctly) block the step as already sent.
+    other = await make_lead(session, email="other-gap@example.com")
+    await make_email_log(session, other.id, campaign.id, inbox_id=inbox.id,
                          sent_at=time_provider.utcnow() - timedelta(minutes=2))
     await jobs_mod.send_slot_job(slot.id)
     assert sent == []
@@ -215,7 +218,10 @@ async def test_minimum_gap_three_minutes_even_if_inbox_allows_less(session, sent
 @pytest.mark.asyncio
 async def test_send_allowed_after_three_minutes(session, sent):
     inbox, campaign, lead, cl, slot = await _setup(session, inbox_kwargs={"wait_minutes_between": 1})
-    await make_email_log(session, lead.id, campaign.id, inbox_id=inbox.id,
+    # Previous mail through the same inbox, but to another lead: a log for
+    # this lead's step 0 would (correctly) block the step as already sent.
+    other = await make_lead(session, email="other-gap@example.com")
+    await make_email_log(session, other.id, campaign.id, inbox_id=inbox.id,
                          sent_at=time_provider.utcnow() - timedelta(minutes=3, seconds=10))
     await jobs_mod.send_slot_job(slot.id)
     assert len(sent) == 1

@@ -1175,11 +1175,12 @@ class TestGlobalRecalculate:
         # Recalculate
         await global_recalculate(session, campaign_id=campaign.id)
 
-        # Leads 0,1: kept seq 0 slot + new seq 1, 2 = 3 slots each = 6
+        # Leads 0,1: seq 0 already logged → its stale slot is dropped (a slot
+        #            for a logged step would send it twice), new seq 1, 2 = 2 each = 4
         # Leads 2,3,4: nothing sent → re-reserved seq 0, 1, 2 = 3 slots each = 9
-        # Total: 15
+        # Total: 13
         result = await session.execute(select(func.count(QueueSlot.id)))
-        assert result.scalar() == 15
+        assert result.scalar() == 13
 
     async def test_recalculate_missing_campaign_handles_gracefully(self, session):
         """Recalculation with an invalid campaign_id should not crash."""
@@ -1225,7 +1226,7 @@ class TestRecalculateQueueAfterSequenceChangeForLeads:
         result = await session.execute(
             select(func.count(QueueSlot.id)).where(QueueSlot.campaign_lead_id == leads[0][1].id)
         )
-        assert result.scalar() == 3  # kept seq 0, rebuilt seq 1..2
+        assert result.scalar() == 2  # logged seq 0 slot dropped, rebuilt seq 1..2
 
         result = await session.execute(
             select(func.count(QueueSlot.id)).where(QueueSlot.campaign_lead_id == leads[1][1].id)

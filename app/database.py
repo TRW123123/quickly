@@ -1,4 +1,5 @@
 """Database connection and session."""
+import logging
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
 
@@ -64,6 +65,60 @@ async def get_db():
 
 # SQLite-specific migration helpers removed: starting fresh with PostgreSQL.
 # A clean database will be created by init_db() using SQLAlchemy metadata.
+
+
+EMAIL_LOG_STEP_UNIQUE_INDEX = "uq_email_log_campaign_lead_step"
+
+
+async def ensure_email_log_step_unique_index(conn) -> bool:
+    """DB backstop: one email_log row per (campaign_id, lead_id, sequence_index).
+
+    Production already contains duplicates from the follow-up resend bug, so a
+    plain UNIQUE index would fail and abort startup.  Instead the index is made
+    *partial*: it covers every row with ``id`` greater than the newest existing
+    duplicate.  Old duplicates stay untouched (audit trail), every row written
+    from now on is unique among the new rows; against old rows the send job's
+    pre-send dedupe check applies.  Without duplicates the index is a plain
+    full UNIQUE index.  Idempotent; returns True when the index was created.
+    Works on PostgreSQL and SQLite (both support partial indexes).
+    """
+    from sqlalchemy import text
+
+    if conn.dialect.name == "postgresql":
+        exists_sql = "SELECT 1 FROM pg_indexes WHERE indexname = :n"
+    else:
+        exists_sql = "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = :n"
+    if (await conn.execute(text(exists_sql), {"n": EMAIL_LOG_STEP_UNIQUE_INDEX})).first():
+        return False
+
+    dup_max = (
+        await conn.execute(
+            text(
+                """
+                SELECT MAX(e.id) FROM email_log AS e
+                WHERE EXISTS (
+                    SELECT 1 FROM email_log AS d
+                    WHERE d.campaign_id = e.campaign_id
+                      AND d.lead_id = e.lead_id
+                      AND d.sequence_index = e.sequence_index
+                      AND d.id <> e.id
+                )
+                """
+            )
+        )
+    ).scalar()
+    ddl = (
+        f"CREATE UNIQUE INDEX IF NOT EXISTS {EMAIL_LOG_STEP_UNIQUE_INDEX} "
+        "ON email_log (campaign_id, lead_id, sequence_index)"
+    )
+    if dup_max is not None:
+        ddl += f" WHERE id > {int(dup_max)}"
+        logging.getLogger("quickly.db").warning(
+            "email_log has duplicate (campaign_id, lead_id, sequence_index) rows up to id=%s; "
+            "creating partial unique index for id > %s", dup_max, dup_max,
+        )
+    await conn.execute(text(ddl))
+    return True
 
 
 async def _run_migrations(conn) -> None:
@@ -263,6 +318,18 @@ async def _run_migrations(conn) -> None:
             "CREATE TABLE IF NOT EXISTS _app_schema_migrations (id VARCHAR(128) PRIMARY KEY)"
         )
     )
+
+    # 2026-11-20: at most one email_log row per sequence step (see
+    # ensure_email_log_step_unique_index).  Runs in a SAVEPOINT so an
+    # unexpected failure is logged instead of aborting startup.
+    try:
+        async with conn.begin_nested():
+            await ensure_email_log_step_unique_index(conn)
+    except Exception:
+        logging.getLogger("quickly.db").exception(
+            "could not create %s – relying on the send job's dedupe check",
+            EMAIL_LOG_STEP_UNIQUE_INDEX,
+        )
 
     # 2026-11-14: inboxes still warming up at the old default cap of 10/day
     # get the new plateau 25 so the weekly schedule (4/9/15/25) governs.
