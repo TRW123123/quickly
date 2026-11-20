@@ -36,6 +36,10 @@ if db_url.startswith("sqlite"):
             "poolclass": StaticPool,
         }
     )
+else:
+    from app.db_pool import async_engine_kwargs
+
+    engine_kwargs.update(async_engine_kwargs(db_url))
 
 engine = create_async_engine(
     db_url,

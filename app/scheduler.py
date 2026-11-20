@@ -61,7 +61,13 @@ def build_jobstores(db_url: str) -> dict:
             "build_jobstores: using SQLAlchemyJobStore (%s)",
             sync_url.render_as_string(hide_password=True),
         )
-        return {"default": SQLAlchemyJobStore(url=sync_url)}
+        from app.db_pool import jobstore_engine_kwargs  # noqa: PLC0415
+
+        return {
+            "default": SQLAlchemyJobStore(
+                url=sync_url, engine_options=jobstore_engine_kwargs()
+            )
+        }
     except Exception as exc:
         log.warning(
             "build_jobstores: could not create SQLAlchemyJobStore (%s); "

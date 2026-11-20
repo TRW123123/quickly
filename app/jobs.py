@@ -2195,12 +2195,28 @@ async def _after_send_side_effects(
 _pending_slot_ids: set[int] = set()
 
 
+_send_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_send_semaphore() -> asyncio.Semaphore:
+    """Process-wide limit on concurrently running send_slot_job calls."""
+    global _send_semaphore
+    if _send_semaphore is None:
+        from app.db_pool import send_concurrency
+
+        _send_semaphore = asyncio.Semaphore(send_concurrency())
+    return _send_semaphore
+
+
 async def _dispatch_slot(slot_id: int, delay: float) -> None:
     """Sleep for *delay* seconds then call send_slot_job.  Removes from pending set."""
     try:
         if delay > 0:
             await asyncio.sleep(delay)
-        await send_slot_job(slot_id)
+        # Bound parallelism: a backlog of overdue slots must not open one DB
+        # connection per slot at the same moment (pooler client limit).
+        async with _get_send_semaphore():
+            await send_slot_job(slot_id)
     except asyncio.CancelledError:
         raise
     except Exception:
